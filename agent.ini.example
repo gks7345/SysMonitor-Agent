@@ -1,0 +1,13 @@
+; SysMonitorAgent.exe와 같은 경로에 agent.ini로 복사해서 사용한다.
+; 파일이 없으면 send_to_server=false로 폴백한다 (§7 기획노트).
+
+[server]
+url = localhost:50051
+send_to_server = true
+
+[agent]
+id = PC-01
+; api_key는 비워 두면 서버가 연결을 거부한다 — 키로 쓸 문자열을 정해서 채울 것.
+; 서버 agents.ini의 [agents] 섹션에 같은 id로 같은 값을 등록해야 한다.
+api_key =
+local_buffer_hours = 24
