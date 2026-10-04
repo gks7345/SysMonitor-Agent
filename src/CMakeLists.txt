@@ -10,7 +10,8 @@ add_library (SysMonitorAgentCore STATIC
 	"collectors/SystemCollector.cpp" "collectors/CpuCollector.cpp" "collectors/MemCollector.cpp" "collectors/NetCollector.cpp" "collectors/DiskCollector.cpp"
 	"collectors/ProcessCollector.cpp" "collectors/ETWNetwork.cpp" "collectors/TargetCollector.cpp"
 	"datastore/DataStore.cpp" "datastore/SummaryStore.cpp"
-	"analysis/SessionReport.cpp")
+	"analysis/SessionReport.cpp"
+	"util/StrUtil.cpp")
 target_include_directories(SysMonitorAgentCore PUBLIC "../include")
 
 target_compile_definitions(SysMonitorAgentCore PRIVATE
@@ -67,7 +68,7 @@ add_library(inih STATIC "${inih_SOURCE_DIR}/ini.c" "${inih_SOURCE_DIR}/cpp/INIRe
 target_include_directories(inih PUBLIC "${inih_SOURCE_DIR}" "${inih_SOURCE_DIR}/cpp")
 
 # main / gRPC 클라이언트 진입점
-add_executable(SysMonitorAgent "grpc/GrpcClient.cpp" "SysMonitorAgent.cpp" "AgentConfig.cpp")
+add_executable(SysMonitorAgent "grpc/GrpcClient.cpp" "grpc/SnapshotConverter.cpp" "SysMonitorAgent.cpp" "AgentConfig.cpp")
 target_link_libraries(SysMonitorAgent PRIVATE SysMonitorAgentCore SysMonitorProto inih)
 
 if(MSVC)
@@ -76,4 +77,8 @@ if(MSVC)
     target_compile_options(SysMonitorProto PRIVATE /utf-8)
     target_compile_options(SysMonitorAgent PRIVATE /utf-8)
     target_compile_options(inih PRIVATE /utf-8)
+    # C4062(enum switch에서 처리 안 된 열거자, default 없을 때)는 /W4에서도 꺼져 있어 직접 켠다 —
+    # TargetStatus·ClientResult 같은 enum에 값이 추가되면 default 없는 switch가 고칠 곳을 알려 주도록.
+    target_compile_options(SysMonitorAgentCore PRIVATE /w14062)
+    target_compile_options(SysMonitorAgent PRIVATE /w14062)
 endif()

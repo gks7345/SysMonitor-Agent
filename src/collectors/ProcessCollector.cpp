@@ -1,19 +1,7 @@
 ﻿#include "collectors/ProcessCollector.h"
+#include "util/StrUtil.h"
 #include <spdlog/spdlog.h>
 #pragma comment(lib, "pdh.lib")
-
-static const char* SYSTEM_NAMES[] = {
-	"_Total", "Idle", "System", "smss", "csrss", "[System Process]",
-	"wininit", "winlogon", "services", "lsass",
-	"fontdrvhost", "dwm", "Memory Compression", nullptr
-};
-
-bool ProcessCollector::isSystemProcess(const std::string& name) const {
-	for (int i = 0; SYSTEM_NAMES[i]; ++i)
-		if (name == SYSTEM_NAMES[i]) return true;
-	return false;
-}
-
 
 ProcessCollector::ProcessCollector(int topN) : topN(topN) {
 	PDH_STATUS statusMiddle = PdhOpenQuery(NULL, 0, &queryMiddle);
@@ -97,8 +85,13 @@ void ProcessCollector::initInfo(PDH_HQUERY& query) {
 }
 
 std::vector<char> ProcessCollector::getCountArray(PDH_HCOUNTER hCounter, DWORD& count) {
+	// PDH_FMT_NOCAP100: 프로세스의 "% Processor Time"은 코어 하나를 다 쓰면 100, 둘이면 200이다.
+	// 이 플래그가 없으면 PDH가 100에서 잘라, 여러 코어를 쓰는 프로세스가 (100 / 코어 수)%로 낮게 보고된다.
+	// 백분율이 아닌 카운터(바이트, PID 등)에는 영향이 없다.
+	constexpr DWORD format = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
+
 	DWORD bufferSize = 0;
-	PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE, &bufferSize, &count, NULL);
+	PdhGetFormattedCounterArray(hCounter, format, &bufferSize, &count, NULL);
 
 	std::vector<char> buffer;
 	if (count == 0 || bufferSize == 0) return buffer;
@@ -106,7 +99,7 @@ std::vector<char> ProcessCollector::getCountArray(PDH_HCOUNTER hCounter, DWORD& 
 	buffer.resize(bufferSize);
 	PDH_STATUS status = PdhGetFormattedCounterArray(
 		hCounter,
-		PDH_FMT_DOUBLE,
+		format,
 		&bufferSize,
 		&count,
 		reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(buffer.data()));
@@ -184,8 +177,9 @@ void ProcessCollector::collectProc() {
 
 		std::string name = nameIt->second;
 
-		//if (name == "_Total" || name == "Idle") continue;
-		if (isSystemProcess(name)) continue;
+		// 이름으로 걸러 내지 않는다 — proc은 전체 목록이고 무엇을 숨길지는 UI가 정한다.
+		// 빼는 것은 PID 0뿐이다: PDH의 합계 항목(_Total)과 Idle이 PID 0이고, 프로세스가 아니라 의사 항목이다.
+		if (pid == 0) continue;
 
 		if (pidItems[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
 			pidItems[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA)
@@ -296,17 +290,18 @@ std::unordered_map<DWORD, ProcEntry> ProcessCollector::buildProcTree() {
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (snap == INVALID_HANDLE_VALUE) return tree;
 
-	PROCESSENTRY32 entry = {};
+	// W 버전 + UTF-8 변환 — ANSI 버전은 코드 페이지에 없는 문자를 '?'로 바꾸고 한글을 CP949로 준다 (기획노트 Phase 3-0)
+	PROCESSENTRY32W entry = {};
 	entry.dwSize = sizeof(entry);
 
-	if (Process32First(snap, &entry)) {
+	if (Process32FirstW(snap, &entry)) {
 		do {
 			ProcEntry pe;
 			pe.pid = entry.th32ProcessID;
 			pe.ppid = entry.th32ParentProcessID;
-			pe.name = entry.szExeFile;
+			pe.name = StrUtil::wideToUtf8(StrUtil::exeBaseName(entry.szExeFile));	// ".exe" 없이 — 타겟 이름과 같은 표기
 			tree[pe.pid] = pe;
-		} while (Process32Next(snap, &entry));
+		} while (Process32NextW(snap, &entry));
 	}
 	CloseHandle(snap);
 	return tree;

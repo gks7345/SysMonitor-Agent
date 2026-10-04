@@ -3,6 +3,8 @@
 #include <string>
 #include <memory>
 
+#include "models/SnapShotData.h"
+
 // connect()/send*()의 결과. 값은 "호출부가 다음에 무엇을 해야 하는가" 기준으로 나눈다.
 // gRPC 타입(grpc::Status)을 헤더에 노출하지 않기 위해 자체 enum을 쓴다 (pimpl 유지).
 enum class ClientResult {
@@ -12,8 +14,8 @@ enum class ClientResult {
     Fatal,            // 그 외 예상 밖 상태 (예: proto 불일치로 인한 UNIMPLEMENTED) → 재시도해도 소용없음
 };
 
-// Phase 1: gRPC 뼈대 — 더미 데이터를 실시간/배치 채널로 각각 전송한다.
-// Phase 2: 연결 시 api_key를 gRPC metadata에 실어 보낸다. Phase 3에서 실제 수집 데이터로 교체 예정.
+// Phase 1: gRPC 뼈대. Phase 2: 연결 시 agent_id/api_key/instance_id를 gRPC metadata에 실어 보낸다.
+// Phase 3: 실시간 채널로 실제 수집 스냅샷(sys / proc 전체 / target)을 보낸다. 배치 채널은 Phase 4-4 갭 전송 전까지 더미.
 class GrpcClient {
 private:
     struct Impl;
@@ -41,12 +43,12 @@ public:
     // 이미 연결된 상태에서 다시 호출해도 안전하다 — 기존 스트림을 먼저 정상 종료(closeStreams())한 뒤 새로 연다.
     ClientResult connect();
 
-    // sys / proc / target 더미 스냅샷을 실시간 채널로 한 건씩(메시지 3개) 전송한다. Phase 3에서 실제 수집 데이터로 교체.
+    // 한 틱의 sys / proc / target 스냅샷을 실시간 채널로 한 건씩(메시지 3개) 전송한다 (스냅샷 1건 = 메시지 1개).
     // 스트림이 끊기면 서버가 보낸 최종 상태를 로그로 남기고 스트림을 버린다 — 이후 호출은 재연결 전까지 Disconnected.
-    ClientResult sendRealtimeDummy();
+    ClientResult sendRealtime(const SnapshotSysData& sys, const SnapshotProcData& proc, const SnapshotTargetData& target);
 
     // 배치 채널 연결 확인용 더미 sys 스냅샷 1건을 전송한다. Phase 4-4에서 갭 전송으로 교체.
-    // 실패 처리는 sendRealtimeDummy()와 같다.
+    // 실패 처리는 sendRealtime()과 같다.
     ClientResult sendBatchDummy();
 
 private:
