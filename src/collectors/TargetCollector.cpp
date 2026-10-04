@@ -36,13 +36,61 @@ namespace {
 		return info;
 	}
 
+	constexpr double BYTES_PER_MB = 1024.0 * 1024.0;
+
+	std::optional<double> bytesToMB(std::optional<double> bytes) {
+		if (!bytes) return std::nullopt;
+		return *bytes / BYTES_PER_MB;
+	}
+
+	std::optional<uint32_t> toCount(std::optional<double> value) {
+		if (!value) return std::nullopt;
+		return static_cast<uint32_t>(*value);
+	}
+
 	// PDH "Working Set - Private"(바이트) → MB. 열 권한이 없는 프로세스는 이 카운터가 0으로 읽히는 경우가 있다
 	// (실측: 서비스로 도는 mysqld — 실제 Working Set은 11.6MB). 권한이 없으면서 0이면 "수집하지 못함"으로 본다.
 	// 권한이 없어도 0이 아닌 값은 PDH가 실제로 읽은 값이므로 그대로 쓴다.
-	std::optional<double> privateWorkingSetMB(double bytes, bool accessDenied) {
-		if (accessDenied && bytes == 0.0) return std::nullopt;
-		return bytes / (1024.0 * 1024.0);
+	std::optional<double> privateWorkingSetMB(std::optional<double> bytes, bool accessDenied) {
+		if (!bytes) return std::nullopt;
+		if (accessDenied && *bytes == 0.0) return std::nullopt;
+		return *bytes / BYTES_PER_MB;
 	}
+
+	// PDH 값을 스냅샷 필드로 옮긴다 — 메인(SnapshotTarget)과 자식(SnapshotChildProcess)이 같은 이름의 필드를 쓴다.
+	// perf가 없거나 그 안의 값이 비어 있으면 스냅샷 필드도 비워 둔다 (0으로 채우지 않는다).
+	template <typename T>
+	void fillPerf(T& dst, const ProcessPerf* perf, bool accessDenied, unsigned int cores) {
+		if (!perf) return;
+		if (perf->cpuPercent) dst.cpuUsage = *perf->cpuPercent / cores;	// 코어 하나당 100 → 시스템 전체 대비 %
+		dst.memoryMB = privateWorkingSetMB(perf->workingSetPrivateBytes, accessDenied);
+		dst.privateMemoryMB = bytesToMB(perf->privateBytes);
+		dst.virtualMemoryMB = bytesToMB(perf->virtualBytes);
+		dst.diskReadMBs = bytesToMB(perf->ioReadBytesPerSec);
+		dst.diskWriteMBs = bytesToMB(perf->ioWriteBytesPerSec);
+		dst.threadCount = toCount(perf->threadCount);
+		dst.handleCount = toCount(perf->handleCount);
+		dst.pageFaultRate = perf->pageFaultsPerSec;
+	}
+
+	// 수집하는 카운터. isRate: 두 시점의 차이로 계산되는 값 — 직전 수집이 바로 앞 틱이 아니면 쓸 수 없다.
+	struct PerfCounterDef {
+		const wchar_t* name;
+		std::optional<double> ProcessPerf::* field;
+		bool isRate;
+	};
+	constexpr PerfCounterDef PERF_COUNTERS[] = {
+		{ L"% Processor Time",      &ProcessPerf::cpuPercent,             true  },
+		{ L"Working Set - Private", &ProcessPerf::workingSetPrivateBytes, false },
+		{ L"Private Bytes",         &ProcessPerf::privateBytes,           false },
+		{ L"Virtual Bytes",         &ProcessPerf::virtualBytes,           false },
+		{ L"IO Read Bytes/sec",     &ProcessPerf::ioReadBytesPerSec,      true  },
+		{ L"IO Write Bytes/sec",    &ProcessPerf::ioWriteBytesPerSec,     true  },
+		{ L"Thread Count",          &ProcessPerf::threadCount,            false },
+		{ L"Handle Count",          &ProcessPerf::handleCount,            false },	// 프로세스를 열 권한이 없어도 읽힌다
+		{ L"Page Faults/sec",       &ProcessPerf::pageFaultsPerSec,       true  },
+		{ L"Elapsed Time",          &ProcessPerf::elapsedSec,             false },
+	};
 } // namespace
 
 TargetCollector::TargetCollector(ETWNetwork& sharedEtwNet) : etwNet(sharedEtwNet) {
@@ -51,7 +99,21 @@ TargetCollector::TargetCollector(ETWNetwork& sharedEtwNet) : etwNet(sharedEtwNet
 
 	PDH_STATUS s = PdhOpenQuery(nullptr, 0, &query);
 	if (s != ERROR_SUCCESS) {
-		spdlog::error("TargetCollector: PdhOpenQuery error 0x{:X}", s);
+		spdlog::error("TargetCollector: PdhOpenQuery error 0x{:X}", static_cast<unsigned>(s));
+		query = nullptr;
+	}
+	else {
+		// 카운터는 여기서 한 번만 등록한다. 영문 이름으로 등록해 다른 언어의 Windows에서도 같은 경로가 통하게 한다.
+		perfCounters.resize(std::size(PERF_COUNTERS), nullptr);
+		for (size_t i = 0; i < std::size(PERF_COUNTERS); ++i) {
+			const std::wstring path = std::wstring(L"\\Process V2(*)\\") + PERF_COUNTERS[i].name;
+			s = PdhAddEnglishCounterW(query, path.c_str(), 0, &perfCounters[i]);
+			if (s != ERROR_SUCCESS) {
+				perfCounters[i] = nullptr;
+				spdlog::error("TargetCollector: counter '{}' could not be added (0x{:X}) — that metric will be unavailable",
+					StrUtil::wideToUtf8(path), static_cast<unsigned>(s));
+			}
+		}
 	}
 
 	lastTime = std::chrono::steady_clock::now();
@@ -59,7 +121,7 @@ TargetCollector::TargetCollector(ETWNetwork& sharedEtwNet) : etwNet(sharedEtwNet
 TargetCollector::~TargetCollector() {
 	clearRegistered();
 	if (query)
-		PdhCloseQuery(query);
+		PdhCloseQuery(query);	// 쿼리에 속한 카운터도 함께 닫힌다
 }
 
 // -------------------------------------------------------
@@ -85,14 +147,6 @@ void TargetCollector::registerTarget(const std::string& rawName) {
 	if (const std::string* existing = findRegistered(name)) {
 		spdlog::warn("TargetCollector: '{}' already registered (as '{}')", rawName, *existing);
 		return;
-	}
-
-	// '#'은 파일 이름으로는 유효하지만 PDH 경로 문법에서 "같은 이름의 N번째 인스턴스" 구분자라,
-	// \Process V2(<이름>:<pid>) 경로로 표현할 수 없다 (실측: 카운터 추가는 성공하고 값 읽기가 실패).
-	// 그런 프로그램이 실제로 있을 수 있으므로 등록은 받되, 수집되지 않는다는 것을 미리 알린다.
-	if (name.find('#') != std::string::npos) {
-		spdlog::warn("TargetCollector: '{}' cannot be collected: '#' is the instance-index separator in a PDH counter path, "
-			"so its counters cannot be addressed. It will be reported as not running even while it runs", name);
 	}
 
 	registeredNames.push_back(name);
@@ -129,7 +183,6 @@ void TargetCollector::unregisterTarget(const std::string& rawName) {
 
 	// 마지막 세션 제거
 	lastSessions.erase(name);
-	activationFailWarned.erase(name);
 	spdlog::info("TargetCollector: '{}' released", name);
 }
 
@@ -199,17 +252,9 @@ bool TargetCollector::waitForPendingUntil(std::chrono::steady_clock::time_point 
 }
 
 void TargetCollector::clearRegistered() {
-	for (auto& e : activeTargets)
-	{
-		releaseProcessCounters(e.main);
-		for (auto& c : e.children)
-			releaseProcessCounters(c);
-	}
-
 	activeTargets.clear();
 	registeredNames.clear();
 	lastSessions.clear();
-	activationFailWarned.clear();
 }
 
 // -------------------------------------------------------
@@ -241,118 +286,104 @@ void TargetCollector::updateLastSession(const std::string& name, const SessionTa
 }
 
 // -------------------------------------------------------
-// PDH 카운터 초기화
+// PDH 수집 — "\Process V2(*)" 와일드카드
+// 프로세스마다 카운터를 등록하지 않는다. 카운터 종류마다 전체 프로세스의 값 배열을 한 번에 받아
+// 타겟/자식의 PID에 해당하는 항목만 꺼낸다 — 수집 비용이 타겟·자식 수와 무관하다
+// (실측: 이름으로 지정한 카운터는 프로세스 하나에 약 12ms씩 늘고, 와일드카드는 프로세스 300개 전체에 약 13ms).
+// 이름으로 경로를 만들지 않으므로 '#'이 든 이름이나 긴 이름의 프로세스도 수집된다.
 // -------------------------------------------------------
-bool TargetCollector::initProcessCounters(ProcessCounters& counters, std::string* failReason) {
-	if (!query || counters.name.empty()) {
-		if (failReason) *failReason = "PDH query is not open";
-		return false;
+std::optional<TargetCollector::PerfMap> TargetCollector::collectProcessPerf() {
+	PerfMap result;
+	if (activeTargets.empty()) {
+		// 실행 중인 타겟이 없으면 수집을 쉰다. 다음에 재개하는 수집은 기준점으로만 쓰인다 (아래 ratesValid)
+		perfCollectedLastTick = false;
+		return result;
 	}
-	if (counters.isChild) {
-		if (PdhOpenQuery(nullptr, 0, &counters.childQuery) != ERROR_SUCCESS)
-			return false;
+	if (!query) return std::nullopt;
+
+	std::unordered_set<DWORD> wanted;
+	for (const auto& entry : activeTargets) {
+		wanted.insert(entry.pid);
+		for (const auto& child : entry.children)
+			wanted.insert(child.pid);
 	}
 
-	auto targetQuery = counters.isChild ? counters.childQuery : query;
-	// Process V2 인스턴스 이름 = "name:pid"
-	std::string instName = counters.name;
-	//spdlog::info("instName: {}", instName);
+	// 비율 값(CPU, 디스크, 페이지 폴트)은 직전 수집과의 차이로 계산된다. 직전 틱에 수집하지 않았으면
+	// (첫 수집이거나, 쉬었다가 재개) PDH는 오래된 기준으로 계산한 값을 유효한 것처럼 돌려준다
+	// (실측: 8초 쉰 뒤의 첫 수집이 8초 평균을 정상 상태로 반환). 그런 수집은 기준점으로만 쓰고 비율 값은 버린다.
+	// 수집 도중 새로 생긴 프로세스의 첫 틱은 PDH가 항목 상태로 알려 주므로 readPerfArray가 걸러 낸다.
+	const bool ratesValid = perfCollectedLastTick;
 
-	auto add = [&](const std::string& path, PDH_HCOUNTER& counter, bool required = false) -> bool {
-		std::string full = "\\Process V2(" + instName + ")\\" + path;
-		//spdlog::info("initProcessCounters: adding '{}'", full);
-		//PDH_STATUS s = PdhAddEnglishCounterA(query, full.c_str(), 0, &counter);
-		PDH_STATUS s = PdhAddCounterW(targetQuery, StrUtil::utf8ToWide(full).c_str(), 0, &counter);
-		//spdlog::info("initProcessCounters: '{}' status=0x{:X}", path, (unsigned)s);
-		if (s != ERROR_SUCCESS) {
-			if (required)
-			{
-				// failReason을 받는 호출부(activateTarget)는 타겟당 1번만 경고하므로 여기서 따로 찍지 않는다
-				if (failReason)
-					*failReason = fmt::format("essential counter '{}' could not be added (0x{:X})", path, static_cast<unsigned>(s));
-				else
-					spdlog::warn("TargetCollector: Essential counter error '{}' 0x{:X}", path, s);
-				return false;
-			}
-			else {
-				spdlog::warn("TargetCollector: Selective counter error '{}' 0x{:X}", path, s);
-				return true;
-			}
-		}
-		return true;
-		};
+	const PDH_STATUS s = PdhCollectQueryData(query);
+	perfCollectedLastTick = (s == ERROR_SUCCESS);
+	if (s != ERROR_SUCCESS) {
+		spdlog::warn("TargetCollector: PdhCollectQueryData failed (0x{:X}) — target metrics are unavailable this tick", static_cast<unsigned>(s));
+		return std::nullopt;
+	}
 
-	// 필수 카운터 — 중간에 실패하면 그때까지 추가된 카운터/childQuery를 정리하고 반환
-	if (!add("% Processor Time", counters.cpu, true)) { releaseProcessCounters(counters); return false; }
-	if (!add("Working Set - Private", counters.mem, true)) { releaseProcessCounters(counters); return false; }
-	if (!add("Private Bytes", counters.privateMem, true)) { releaseProcessCounters(counters); return false; }
-	if (!add("IO Read Bytes/sec", counters.diskR, true)) { releaseProcessCounters(counters); return false; }
-	if (!add("IO Write Bytes/sec", counters.diskW, true)) { releaseProcessCounters(counters); return false; }
-
-	// 선택 카운터
-	add("Virtual Bytes", counters.virtualMem);
-	add("Thread Count", counters.threads);
-	add("Handle Count", counters.handles);	// GetProcessHandleCount 대신 — 프로세스를 열 권한이 없어도 읽힌다
-	add("Page Faults/sec", counters.pageFault);
-	add("Elapsed Time", counters.elapsed);
-
-	// 기준점 수집
-	PdhCollectQueryData(targetQuery);
-
-	return true;
+	for (size_t i = 0; i < std::size(PERF_COUNTERS) && i < perfCounters.size(); ++i) {
+		if (!perfCounters[i]) continue;
+		if (PERF_COUNTERS[i].isRate && !ratesValid) continue;
+		readPerfArray(perfCounters[i], PERF_COUNTERS[i].field, wanted, result);
+	}
+	return result;
 }
 
-// -------------------------------------------------------
-// PDH 카운터 해제
-// -------------------------------------------------------
-void TargetCollector::releaseProcessCounters(ProcessCounters& counters) {
-	if (counters.isChild && counters.childQuery) {
-		PdhCloseQuery(counters.childQuery);
-		counters.childQuery = nullptr;
+void TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out) {
+	// PDH_FMT_NOCAP100: 프로세스의 "% Processor Time"은 코어 하나를 다 쓰면 100, 둘이면 200이다.
+	// 이 플래그가 없으면 PDH가 100에서 잘라, 여러 코어를 쓰는 프로세스가 (100 / 코어 수)%로 낮게 보고된다.
+	constexpr DWORD format = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
+
+	// 버퍼가 작으면 PDH_MORE_DATA와 함께 필요한 크기를 돌려준다. 크기를 맞춘 뒤 읽는 사이에 프로세스가 늘 수 있으므로 몇 번 다시 시도한다.
+	DWORD count = 0;
+	PDH_STATUS s = PDH_MORE_DATA;
+	for (int attempt = 0; attempt < 3 && s == PDH_MORE_DATA; ++attempt) {
+		DWORD size = static_cast<DWORD>(perfBuffer.size());
+		s = PdhGetFormattedCounterArrayW(counter, format, &size, &count,
+			perfBuffer.empty() ? nullptr : reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(perfBuffer.data()));
+		if (s == PDH_MORE_DATA) perfBuffer.resize(size);
 	}
-	auto remove = [](PDH_HCOUNTER& c) {
-		if (c) { PdhRemoveCounter(c); c = nullptr; }
-		};
-	remove(counters.cpu);
-	remove(counters.mem);
-	remove(counters.privateMem);
-	remove(counters.virtualMem);
-	remove(counters.diskR);
-	remove(counters.diskW);
-	remove(counters.threads);
-	remove(counters.handles);
-	remove(counters.pageFault);
-	remove(counters.elapsed);
+	if (s != ERROR_SUCCESS) {
+		spdlog::debug("TargetCollector: PdhGetFormattedCounterArray failed (0x{:X})", static_cast<unsigned>(s));
+		return;
+	}
+
+	const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(perfBuffer.data());
+	for (DWORD i = 0; i < count; ++i) {
+		// 항목 이름은 "<실행 파일 이름>:<pid>". 긴 이름은 잘려서 오므로 이름은 보지 않고 PID만 쓴다 (실행 파일 이름에는 ':'가 올 수 없다).
+		// ':'가 없는 항목은 합계(_Total)다.
+		const wchar_t* colon = wcsrchr(items[i].szName, L':');
+		if (!colon) continue;
+		const DWORD pid = wcstoul(colon + 1, nullptr, 10);
+		if (wanted.find(pid) == wanted.end()) continue;
+
+		ProcessPerf& perf = out[pid];	// 값이 유효하지 않아도 항목은 만든다 — "PDH 배열에 있었다"는 표시
+		const DWORD status = items[i].FmtValue.CStatus;
+		if (status != PDH_CSTATUS_VALID_DATA && status != PDH_CSTATUS_NEW_DATA) continue;	// 새 프로세스의 첫 틱 비율 값 등
+		const double value = items[i].FmtValue.doubleValue;
+		if (std::isnan(value) || std::isinf(value)) continue;
+		perf.*field = value;
+	}
 }
 
 // -------------------------------------------------------
 // 자식 프로세스 수집
 // -------------------------------------------------------
-SnapshotChildProcess TargetCollector::collectChild(ProcessCounters& counters, double elapsedSec, const ConnectionMap& connMap, bool& accessDenied) {
-	if (counters.isChild && counters.childQuery)
-		PdhCollectQueryData(counters.childQuery);
-
+SnapshotChildProcess TargetCollector::collectChild(const TrackedProcess& child, const ProcessPerf* perf, double elapsedSec, const ConnectionMap& connMap, bool& accessDenied) {
 	SnapshotChildProcess c;
-	c.pid = counters.pid;
-	c.processName = counters.exeName;	// syncChildren()이 프로세스 목록에서 받아 둔 실제 이름 — 매 틱 다시 조회하지 않는다
+	c.pid = child.pid;
+	c.processName = child.exeName;	// syncChildren()이 프로세스 목록에서 받아 둔 실제 이름 — 매 틱 다시 조회하지 않는다
 
-	const OpenedProcessInfo opened = queryOpenedProcess(counters.pid);
+	const OpenedProcessInfo opened = queryOpenedProcess(child.pid);
 	if (opened.accessDenied) accessDenied = true;
 
-	c.cpuUsage = getPdhDouble(counters.cpu) / cores;
-	c.memoryMB = privateWorkingSetMB(getPdhDouble(counters.mem), opened.accessDenied);
-	c.privateMemoryMB = getPdhDouble(counters.privateMem) / (1024.0 * 1024.0);
-	c.diskReadMBs = getPdhDouble(counters.diskR) / (1024.0 * 1024.0);
-	c.diskWriteMBs = getPdhDouble(counters.diskW) / (1024.0 * 1024.0);
-	c.threadCount = static_cast<uint32_t>(getPdhDouble(counters.threads));
-	c.handleCount = static_cast<uint32_t>(getPdhDouble(counters.handles));
+	fillPerf(c, perf, opened.accessDenied, cores);
 	c.gdiObjectCount = opened.gdiObjectCount;
-	c.pageFaultRate = getPdhDouble(counters.pageFault);
 
-	NetMbps net = etwNet.getAndResetForTarget(counters.pid, elapsedSec);
+	NetMbps net = etwNet.getAndResetForTarget(child.pid, elapsedSec);
 	c.netSentMbps = net.sentMbps;
 	c.netRecvMbps = net.recvMbps;
-	c.connections = lookupConnections(connMap, counters.pid);
+	c.connections = lookupConnections(connMap, child.pid);
 
 	return c;
 }
@@ -360,44 +391,48 @@ SnapshotChildProcess TargetCollector::collectChild(ProcessCounters& counters, do
 // -------------------------------------------------------
 // 단일 타겟 수집
 // -------------------------------------------------------
-SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsedSec, const ConnectionMap& connMap, const ProcessList* procs) {
+SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsedSec, const ConnectionMap& connMap, const ProcessList* procs, const PerfMap* perf) {
+	auto perfOf = [&](DWORD pid) -> const ProcessPerf* {
+		if (!perf) return nullptr;
+		auto it = perf->find(pid);
+		return it == perf->end() ? nullptr : &it->second;
+		};
+
 	SnapshotTarget s;
-	s.pid = entry.main.pid;
+	s.pid = entry.pid;
 	s.targetName = entry.targetName;
 	s.processName = entry.exeName;
-	s.exePath = getExePath(entry.main.pid);
+	s.exePath = getExePath(entry.pid);
 
-	const OpenedProcessInfo opened = queryOpenedProcess(entry.main.pid);
+	const OpenedProcessInfo opened = queryOpenedProcess(entry.pid);
 	bool accessDenied = opened.accessDenied;	// 메인 또는 자식 중 하나라도 열 권한이 없었는가
 
-	// 메인 프로세스 수집
-	s.cpuUsage = getPdhDouble(entry.main.cpu) / cores;
-	s.memoryMB = privateWorkingSetMB(getPdhDouble(entry.main.mem), opened.accessDenied);
-	s.privateMemoryMB = getPdhDouble(entry.main.privateMem) / (1024.0 * 1024.0);
-	s.virtualMemoryMB = getPdhDouble(entry.main.virtualMem) / (1024.0 * 1024.0);
-	s.diskReadMBs = getPdhDouble(entry.main.diskR) / (1024.0 * 1024.0);
-	s.diskWriteMBs = getPdhDouble(entry.main.diskW) / (1024.0 * 1024.0);
-	s.threadCount = static_cast<uint32_t>(getPdhDouble(entry.main.threads));
-	s.handleCount = static_cast<uint32_t>(getPdhDouble(entry.main.handles));
+	// 메인 프로세스 — PDH가 이 틱에 값을 주지 않았으면(mainPerf 없음) 지표를 비운 채 보낸다
+	const ProcessPerf* mainPerf = perfOf(entry.pid);
+	fillPerf(s, mainPerf, opened.accessDenied, cores);
+	if (mainPerf) s.elapsedSec = mainPerf->elapsedSec;
 	s.gdiObjectCount = opened.gdiObjectCount;
-	s.pageFaultRate = getPdhDouble(entry.main.pageFault);
-	s.elapsedSec = getPdhDouble(entry.main.elapsed);
 
 	// ETW 네트워크
-	NetMbps net = etwNet.getAndResetForTarget(entry.main.pid, elapsedSec);
+	NetMbps net = etwNet.getAndResetForTarget(entry.pid, elapsedSec);
 	s.netSentMbps = net.sentMbps;
 	s.netRecvMbps = net.recvMbps;
-	s.connections = lookupConnections(connMap, entry.main.pid);
+	s.connections = lookupConnections(connMap, entry.pid);
 
 	// 자식 프로세스 수집
 	// syncChildren()이 최대 5초 주기로만 목록을 정리하므로, 그 사이 이미 종료된 자식이
 	// entry.children에 남아있을 수 있다 — 이번 틱의 프로세스 목록에 없으면 수집하지 않고 스냅샷에서 제외한다
-	// (수치 0인 유령 항목이 서버로 나가는 것을 방지). 판정은 메인과 같은 목록, 같은 규칙(PID + 이름)이다
-	// (이전에는 자식마다 매 틱 스냅샷을 따로 뜨고 PID만 봤다).
+	// (값이 빈 유령 항목이 서버로 나가는 것을 방지). 판정은 메인과 같은 목록, 같은 규칙(PID + 이름)이다.
 	// 목록을 못 받은 틱(procs == nullptr)은 생존 여부를 알 수 없으므로 유령으로 단정하지 않고 그대로 수집한다.
-	for (auto& child : entry.children) {
+	for (const auto& child : entry.children) {
 		if (procs && !isAlive(*procs, child.pid, child.exeName)) continue;
-		s.children.push_back(collectChild(child, elapsedSec, connMap, accessDenied));
+
+		// PDH 수집은 됐는데 배열에 이 자식이 없다 — 프로세스 목록을 뜬 직후 종료된 경우다. 이번 틱은 뺀다.
+		// PDH 수집 자체가 실패한 틱(perf == nullptr)은 자식을 지우지 않고 값만 비운 채 보낸다 — 못 받은 것과 없는 것은 다르다.
+		const ProcessPerf* childPerf = perfOf(child.pid);
+		if (perf && !childPerf) continue;
+
+		s.children.push_back(collectChild(child, childPerf, elapsedSec, connMap, accessDenied));
 	}
 
 	// 서버에는 "값 없음"으로 나가지만 원인(권한)과 해결책은 여기서만 알 수 있다 — 활성화당 1번만 남긴다.
@@ -405,7 +440,7 @@ SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsed
 		entry.limitedAccessWarned = true;
 		spdlog::warn("TargetCollector: '{}' (PID={}) cannot be opened (access denied): memory / exe path / GDI count may be "
 			"unavailable and are sent as N/A, not 0. Run the Agent elevated or as a service to collect them",
-			entry.targetName, entry.main.pid);
+			entry.targetName, entry.pid);
 	}
 
 	return s;
@@ -413,49 +448,25 @@ SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsed
 
 // -------------------------------------------------------
 // 실행 감지 → 수집 시작
+// 프로세스 목록에서 찾은 프로세스를 수집 대상으로 올린다. PDH 쪽에는 할 일이 없다 —
+// 값은 매 틱 와일드카드 배열에서 PID로 찾으므로, 등록에 실패해 "실행 중인데 수집되지 않는" 경우가 없다.
 // -------------------------------------------------------
-PdhInstanceInfo TargetCollector::activateTarget(const std::string& name, const RunningProcess& proc) {
-	// 이미 active인지 확인
+bool TargetCollector::activateTarget(const std::string& name, const RunningProcess& proc) {
 	auto it = std::find_if(activeTargets.begin(), activeTargets.end(),
 		[&](const TargetEntry& e) { return e.targetName == name; });
-	if (it != activeTargets.end()) return {};
+	if (it != activeTargets.end()) return false;
 
-	// PDH 인스턴스 경로에는 등록 이름이 아니라 실제 실행 파일 이름을 쓴다 — 매칭이 대소문자를 무시하므로
-	// 둘의 대소문자가 다를 수 있고, PDH가 인스턴스 이름을 대소문자 무시로 찾아 준다는 보장에 기대지 않는다.
-	std::string failReason;
-	auto info = findPdhInstance(proc.exeName, proc.pid, failReason);
-	if (info.isValid()) {
-		spdlog::debug("activateTarget: '{}' findPdhInstance done PID={}", name, info.pid);
+	TargetEntry entry;
+	entry.targetName = name;
+	entry.exeName = proc.exeName;
+	entry.pid = proc.pid;
 
-		TargetEntry entry;
-		entry.targetName = name;
-		entry.exeName = proc.exeName;
-		entry.main.pid = info.pid;
-		entry.main.name = info.instanceName;
-
-		if (initProcessCounters(entry.main, &failReason)) {
-			if (proc.exeName != name) {
-				spdlog::info("TargetCollector: '{}' matched process '{}.exe' (names are case-insensitive)", name, proc.exeName);
-			}
-			activeTargets.push_back(std::move(entry));
-			activationFailWarned.erase(name);
-			spdlog::info("TargetCollector: '{}' (PID={}) collect start", name, info.pid);
-			return info;
-		}
+	if (proc.exeName != name) {
+		spdlog::info("TargetCollector: '{}' matched process '{}.exe' (names are case-insensitive)", name, proc.exeName);
 	}
-
-	// 여기까지 왔으면 "실행 중인데 수집을 시작하지 못함"이다.
-	// 서버에는 미실행 상태로 나가므로 원인은 이 로그에서만 알 수 있다. 활성화는 매 틱 다시 시도하지만
-	// 경고는 같은 프로세스(PID)에 대해 1번만 남긴다 — 이전에는 원인 없는 info('No Active')가 매 초 쌓였다.
-	auto warned = activationFailWarned.find(name);
-	if (warned == activationFailWarned.end() || warned->second != proc.pid) {
-		activationFailWarned[name] = proc.pid;
-		spdlog::warn("TargetCollector: '{}' (PID={}) is running but could not be activated: {}{}. "
-			"It is reported as not running; activation is retried every tick and this warning is logged once",
-			name, proc.pid, failReason,
-			proc.exeName.find('#') != std::string::npos ? " ('#' in the name cannot be expressed in a PDH counter path)" : "");
-	}
-	return {};
+	activeTargets.push_back(std::move(entry));
+	spdlog::info("TargetCollector: '{}' (PID={}) collect start", name, proc.pid);
+	return true;
 }
 
 // -------------------------------------------------------
@@ -466,9 +477,6 @@ void TargetCollector::deactivateTarget(const std::string& name, bool notifyPendi
 	if (it == activeTargets.end()) return;
 
 	spdlog::info("TargetCollector: '{}' collect stop", it->targetName);
-	releaseProcessCounters(it->main);
-	for (auto& c : it->children)
-		releaseProcessCounters(c);
 	activeTargets.erase(it);
 
 	if (notifyPending)
@@ -481,46 +489,19 @@ void TargetCollector::deactivateTarget(const std::string& name, bool notifyPendi
 void TargetCollector::syncChildren(TargetEntry& entry, const ProcessList& procs) {
 	// 종료된 자식 제거 — 목록에 "같은 PID + 같은 이름"이 없으면 종료로 본다 (isAlive 규칙).
 	// 추가보다 먼저 한다: PID가 다른 프로세스에 재사용된 경우 옛 항목을 지워야 아래에서 새 프로세스로 다시 볼 수 있다.
-	auto termination = [&](ProcessCounters& c) -> bool {
-		bool alive = isAlive(procs, c.pid, c.exeName);
-		if (!alive) releaseProcessCounters(c);
-		return !alive;
-		};
 	entry.children.erase(std::remove_if(entry.children.begin(), entry.children.end(),
-		termination), entry.children.end());
+		[&](const TrackedProcess& c) { return !isAlive(procs, c.pid, c.exeName); }), entry.children.end());
 
-	// 새 자식 추가 — collect()가 뜬 프로세스 목록에서 부모가 이 타겟의 메인인 것을 고른다 (스냅샷을 따로 뜨지 않는다)
+	// 새 자식 추가 — collect()가 뜬 프로세스 목록에서 부모가 이 타겟의 메인인 것을 고른다 (스냅샷을 따로 뜨지 않는다).
+	// 실행 파일이 부모와 달라도 자식이다 (스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등).
 	for (const auto& p : procs) {
-		if (p.ppid != entry.main.pid || p.pid == entry.main.pid) continue;
-		const DWORD cpid = p.pid;
+		if (p.ppid != entry.pid || p.pid == entry.pid) continue;
 
 		bool exists = std::any_of(entry.children.begin(), entry.children.end(),
-			[&](const ProcessCounters& c) { return c.pid == cpid; });
+			[&](const TrackedProcess& c) { return c.pid == p.pid; });
 		if (exists) continue;
 
-		// PDH 인스턴스 이름은 "<그 프로세스의 실행 파일 이름>:<pid>"다 — 자식의 경로는 부모가 아니라 자식 자신의 이름으로 만든다.
-		// 부모 이름으로 만들면 실행 파일이 부모와 다른 자식(스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등)은
-		// 존재하지 않는 인스턴스를 찾게 되어 수집되지 않는다.
-		const std::string childExe = StrUtil::wideToUtf8(p.exeName);
-		std::string failReason;
-		auto info = findPdhInstance(childExe, cpid, failReason);
-		if (!info.isValid()) {
-			// 여기로 오는 것은 목록을 뜬 뒤 조회 전에 자식이 종료된 경우(다음 동기화에서 사라짐)이거나
-			// 이름에 '#'이 있어 PDH 경로로 표현할 수 없는 경우다. 5초마다 다시 시도되므로 debug로 둔다.
-			spdlog::debug("TargetCollector: '{}' child '{}' PID={} skipped: {}", entry.targetName, childExe, cpid, failReason);
-			continue;
-		}
-
-		ProcessCounters pc;
-		pc.pid = cpid;
-		pc.name = info.instanceName;
-		pc.exeName = childExe;
-		pc.isChild = true;
-
-		if (initProcessCounters(pc)) {
-			entry.children.push_back(std::move(pc));
-			//spdlog::info("TargetCollector: '{}' add child PID={}", entry.targetName, cpid);
-		}
+		entry.children.push_back(TrackedProcess{ p.pid, StrUtil::wideToUtf8(p.exeName) });
 	}
 }
 
@@ -564,16 +545,8 @@ void TargetCollector::collect() {
 		auto runningPids = findRunningPids(*procs, notActiveNames);
 		for (const auto& name : notActiveNames) {
 			auto it = runningPids.find(name);
-			if (it == runningPids.end()) {
-				// 이번 틱엔 미실행 -> PDH 비용 없이 스킵. 다음 실행에서 활성화가 또 실패하면 다시 경고하도록 기록을 지운다
-				activationFailWarned.erase(name);
-				continue;
-			}
-
-			auto info = activateTarget(name, it->second);
-			if (info.isValid()) {
-				spdlog::info("TargetCollector: '{}' (PID={}) running detect", name, info.pid);
-			}
+			if (it == runningPids.end()) continue;	// 이번 틱엔 미실행
+			activateTarget(name, it->second);
 		}
 	}
 
@@ -585,8 +558,8 @@ void TargetCollector::collect() {
 		cleanupTick = 0;
 	}
 
-	// PDH 수집
-	if (!activeTargets.empty()) PdhCollectQueryData(query);
+	// PDH 수집 — 실행 중인 타겟이 있을 때만. 전체 프로세스의 값을 한 번에 받아 타겟/자식의 PID만 꺼낸다.
+	const std::optional<PerfMap> perf = collectProcessPerf();
 
 	// 종료된 프로세스 감지
 	std::vector<std::string> deadTargets;
@@ -595,12 +568,12 @@ void TargetCollector::collect() {
 	for (auto& entry : activeTargets) {
 		// 생존은 프로세스 목록으로만 판정한다 — OpenProcess 성공은 "실행 중"이 아니고(핸들이 남은 종료 프로세스),
 		// 실패는 "종료"가 아니다(권한 부족). 목록을 못 받은 틱(procs 없음)은 직전 상태(실행 중)를 유지한다.
-		if (procs && !isAlive(*procs, entry.main.pid, entry.exeName)) {
+		if (procs && !isAlive(*procs, entry.pid, entry.exeName)) {
 			spdlog::info("TargetCollector: '{}' shutdown detect", entry.targetName);
 			deadTargets.push_back(entry.targetName);
 			continue;
 		}
-		SnapshotTarget s = collectTarget(entry, elapsedSec, connMap, procs ? &*procs : nullptr);
+		SnapshotTarget s = collectTarget(entry, elapsedSec, connMap, procs ? &*procs : nullptr, perf ? &*perf : nullptr);
 		s.calcTotals();
 		snapshot.targets.push_back(std::move(s));
 	}
@@ -695,62 +668,6 @@ bool TargetCollector::isAlive(const ProcessList& procs, DWORD pid, const std::st
 }
 
 // -------------------------------------------------------
-// PDH 인스턴스 탐색 — Process V2 적용 (메인/자식 공용)
-// 이미 알아낸 PID로 "\Process V2(<name>:<pid>)\Process ID"를 읽어 그 인스턴스가 실제로 그 PID인지 확인한다.
-// 실패하면 로그를 남기지 않고 failReason에 원인을 담아 돌려준다 — 얼마나 자주 알릴지는 호출부가 정한다
-// (activateTarget은 타겟당 1번). 이전에는 값 읽기 실패 분기에 로그가 없어 원인이 드러나지 않았다.
-// -------------------------------------------------------
-PdhInstanceInfo TargetCollector::findPdhInstance(const std::string& name, DWORD targetPid, std::string& failReason) {
-	if (targetPid == 0) {
-		failReason = "PID is 0";
-		return {};
-	}
-
-	// Process V2 인스턴스 이름 = "name:pid"
-	std::string instName = name + ":" + std::to_string(targetPid);
-	std::string path = "\\Process V2(" + instName + ")\\Process ID";
-	spdlog::debug("findPdhInstance: path='{}'", path);
-
-	PDH_HQUERY tq = nullptr;
-	PDH_HCOUNTER tc = nullptr;
-
-	PDH_STATUS s = PdhOpenQuery(nullptr, 0, &tq);
-	if (s != ERROR_SUCCESS) {
-		failReason = fmt::format("PdhOpenQuery failed (0x{:X})", static_cast<unsigned>(s));
-		return {};
-	}
-
-	s = PdhAddCounterW(tq, StrUtil::utf8ToWide(path).c_str(), 0, &tc);
-	if (s != ERROR_SUCCESS) {
-		PdhCloseQuery(tq);
-		failReason = fmt::format("PDH counter '{}' could not be added (0x{:X})", path, static_cast<unsigned>(s));
-		return {};
-	}
-
-	const PDH_STATUS collectStatus = PdhCollectQueryData(tq);
-
-	PDH_FMT_COUNTERVALUE val = {};
-	s = PdhGetFormattedCounterValue(tc, PDH_FMT_LONG, nullptr, &val);
-	PdhCloseQuery(tq);
-	if (s != ERROR_SUCCESS) {
-		failReason = fmt::format("PDH counter '{}' could not be read (collect 0x{:X}, value 0x{:X})",
-			path, static_cast<unsigned>(collectStatus), static_cast<unsigned>(s));
-		return {};
-	}
-
-	DWORD pid = static_cast<DWORD>(val.longValue);
-	if (pid != targetPid) {
-		failReason = fmt::format("PDH instance '{}' reports PID {}", instName, pid);
-		return {};
-	}
-
-	PdhInstanceInfo result;
-	result.instanceName = instName;		// "chrome:7500"
-	result.pid = pid;
-	return result;
-}
-
-// -------------------------------------------------------
 // 실행 파일 경로
 // -------------------------------------------------------
 std::optional<std::string> TargetCollector::getExePath(DWORD pid) {
@@ -772,25 +689,6 @@ std::optional<std::string> TargetCollector::getExePath(DWORD pid) {
 	}
 	CloseHandle(hProc);
 	return result;
-}
-
-// -------------------------------------------------------
-// PDH 값 double 반환
-// -------------------------------------------------------
-double TargetCollector::getPdhDouble(PDH_HCOUNTER counter) {
-	if (!counter) return 0.0;
-	PDH_FMT_COUNTERVALUE val = {};
-	// PDH_FMT_NOCAP100: 프로세스의 "% Processor Time"은 코어 하나를 다 쓰면 100, 둘이면 200이다.
-	// 이 플래그가 없으면 PDH가 100에서 잘라, 여러 코어를 쓰는 프로세스가 (100 / 코어 수)%로 낮게 보고된다.
-	// 백분율이 아닌 카운터(바이트, 개수 등)에는 영향이 없다.
-	PDH_STATUS status = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, nullptr, &val);
-	if (status != ERROR_SUCCESS)
-		return 0.0;
-	if (val.CStatus != PDH_CSTATUS_VALID_DATA && val.CStatus != PDH_CSTATUS_NEW_DATA)
-		return 0.0;
-	if (std::isnan(val.doubleValue) || std::isinf(val.doubleValue))
-		return 0.0;
-	return val.doubleValue;
 }
 
 // -------------------------------------------------------
