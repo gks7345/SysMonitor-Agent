@@ -1,4 +1,5 @@
 ﻿#include "collectors/ETWNetwork.h"
+#include "util/StrUtil.h"
 #include <spdlog/spdlog.h>
 
 ETWNetwork* ETWNetwork::instance = nullptr;
@@ -32,7 +33,7 @@ GUID ETWNetwork::findProviderGuid(const std::wstring& providerName) {
 
         if (providerName == name) {
             spdlog::info("ETWNetwork: Provider '{}' GUID Search Success",
-                std::string(providerName.begin(), providerName.end()));
+                StrUtil::wideToUtf8(providerName));
             return entry.ProviderGuid;
         }
     }

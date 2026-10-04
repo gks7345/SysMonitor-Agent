@@ -344,17 +344,20 @@ void DataStore::flushTargetToDBInternal() {
         for (const auto& snap : items) {
             int64_t ts = toTimestamp(snap.timestamp);
             for (const auto& t : snap.targets) {
-                // not_running/never_seen 항목은 실시간 API 표시용일 뿐 실제 수집 데이터가 아니므로
+                // NOT_RUNNING/NEVER_SEEN 항목은 실시간 API 표시용일 뿐 실제 수집 데이터가 아니므로
                 // 영구 저장(DuckDB)에서는 제외 — 꺼져있던 시간대가 history 조회 시 gap으로 잡히도록 유지
-                if (t.status != "running") continue;
+                if (t.status != TargetStatus::RUNNING) continue;
 
                 mainApp.BeginRow();
                 mainApp.Append(ts);
                 mainApp.Append(duckdb::string_t(t.targetName));
-                mainApp.Append(duckdb::string_t(t.exePath));
+                // 수집하지 못한 값(std::optional 비어 있음)을 여기서는 빈 문자열/0으로 저장한다 — 지금 이 저장 경로는
+                // 메인 루프에 연결돼 있지 않다. Phase 4-3에서 로컬 버퍼로 되살릴 때 NULL로 저장해야
+                // 갭 전송(Phase 4-4)에서도 "수집하지 못함"이 0으로 바뀌지 않는다 (Phase 3 리뷰 High #5).
+                mainApp.Append(duckdb::string_t(t.exePath.value_or(std::string())));
                 mainApp.Append(static_cast<int32_t>(t.pid));
                 mainApp.Append(safeDouble(t.cpuUsage));
-                mainApp.Append(safeDouble(t.memoryMB));
+                mainApp.Append(safeDouble(t.memoryMB.value_or(0.0)));
                 mainApp.Append(safeDouble(t.privateMemoryMB));
                 mainApp.Append(safeDouble(t.virtualMemoryMB));
                 mainApp.Append(safeDouble(t.diskReadMBs));
@@ -363,7 +366,7 @@ void DataStore::flushTargetToDBInternal() {
                 mainApp.Append(safeDouble(t.netRecvMbps));
                 mainApp.Append(static_cast<int32_t>(t.threadCount));
                 mainApp.Append(static_cast<int32_t>(t.handleCount));
-                mainApp.Append(static_cast<int32_t>(t.gdiObjectCount));
+                mainApp.Append(static_cast<int32_t>(t.gdiObjectCount.value_or(0)));
                 mainApp.Append(safeDouble(t.pageFaultRate));
                 mainApp.Append(safeDouble(t.elapsedSec));
                 mainApp.Append(safeDouble(t.totalCpuUsage));
@@ -396,7 +399,7 @@ void DataStore::flushTargetToDBInternal() {
                     childApp.Append(static_cast<int32_t>(c.pid));
                     childApp.Append(duckdb::string_t(c.processName));
                     childApp.Append(safeDouble(c.cpuUsage));
-                    childApp.Append(safeDouble(c.memoryMB));
+                    childApp.Append(safeDouble(c.memoryMB.value_or(0.0)));
                     childApp.Append(safeDouble(c.privateMemoryMB));
                     childApp.Append(safeDouble(c.virtualMemoryMB));
                     childApp.Append(safeDouble(c.diskReadMBs));
@@ -405,7 +408,7 @@ void DataStore::flushTargetToDBInternal() {
                     childApp.Append(safeDouble(c.netRecvMbps));
                     childApp.Append(static_cast<int32_t>(c.threadCount));
                     childApp.Append(static_cast<int32_t>(c.handleCount));
-                    childApp.Append(static_cast<int32_t>(c.gdiObjectCount));
+                    childApp.Append(static_cast<int32_t>(c.gdiObjectCount.value_or(0)));
                     childApp.Append(safeDouble(c.pageFaultRate));
                     childApp.EndRow();
 

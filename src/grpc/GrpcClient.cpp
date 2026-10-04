@@ -2,6 +2,7 @@
 #include <spdlog/spdlog.h>
 
 #include "grpc/GrpcClient.h"
+#include "grpc/SnapshotConverter.h"
 #include <grpcpp/grpcpp.h>
 #include "sysmonitor.grpc.pb.h"
 
@@ -13,7 +14,7 @@ namespace {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    // Phase 3에서 실제 수집기(SnapShotData.h → proto 변환, grpc/ 쪽에 둘 것)로 교체될 더미 스냅샷들.
+    // 배치 채널 연결 확인용 더미 — Phase 4-4 갭 전송으로 교체된다.
     sysmonitor::AgentData makeDummySys(const std::string& agentId) {
         sysmonitor::AgentData data;
         data.set_agent_id(agentId);
@@ -21,30 +22,6 @@ namespace {
         sys->set_timestamp_us(nowEpochMicros());
         sys->set_cpu_total(12.5);
         sys->set_mem_usage_percent(48.0);
-        return data;
-    }
-
-    sysmonitor::AgentData makeDummyProc(const std::string& agentId) {
-        sysmonitor::AgentData data;
-        data.set_agent_id(agentId);
-        sysmonitor::ProcSnapshot* proc = data.mutable_proc();
-        proc->set_timestamp_us(nowEpochMicros());
-        sysmonitor::ProcInfo* p = proc->add_procs();
-        p->set_pid(1234);
-        p->set_name("dummy.exe");
-        p->set_cpu_usage(3.0);
-        p->set_memory_mb(64.0);
-        return data;
-    }
-
-    sysmonitor::AgentData makeDummyTarget(const std::string& agentId) {
-        sysmonitor::AgentData data;
-        data.set_agent_id(agentId);
-        sysmonitor::TargetSnapshot* target = data.mutable_target();
-        target->set_timestamp_us(nowEpochMicros());
-        sysmonitor::TargetInfo* t = target->add_targets();
-        t->set_name("dummy-target.exe");
-        t->set_status(sysmonitor::TargetInfo::NEVER_SEEN);
         return data;
     }
 
@@ -192,19 +169,20 @@ ClientResult GrpcClient::connect() {
 }
 
 
-ClientResult GrpcClient::sendRealtimeDummy() {
+ClientResult GrpcClient::sendRealtime(const SnapshotSysData& sys, const SnapshotProcData& proc, const SnapshotTargetData& target) {
     if (!impl_) {
         return ClientResult::Disconnected;   // moved-from 객체
     }
 
-    // 스냅샷 1건 = 메시지 1개. 하나라도 실패하면 스트림은 이미 버려졌으므로 나머지는 보내지 않는다.
-    for (const sysmonitor::AgentData& data : { makeDummySys(agentId_), makeDummyProc(agentId_), makeDummyTarget(agentId_) }) {
-        ClientResult result = writeOrFinish("realtime", impl_->realtimeStream, data);
-        if (result != ClientResult::Ok) {
-            return result;
-        }
+    // 스냅샷 1건 = 메시지 1개. 하나라도 실패하면 스트림은 이미 버려졌으므로 나머지는 변환도 전송도 하지 않는다.
+    ClientResult result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, sys));
+    if (result == ClientResult::Ok) {
+        result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, proc));
     }
-    return ClientResult::Ok;
+    if (result == ClientResult::Ok) {
+        result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, target));
+    }
+    return result;
 }
 
 ClientResult GrpcClient::sendBatchDummy() {

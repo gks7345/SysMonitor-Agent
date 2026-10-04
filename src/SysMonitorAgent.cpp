@@ -1,27 +1,64 @@
 #include <chrono>
 #include <optional>
 #include <string>
-#include <thread>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
 
 #include <spdlog/spdlog.h>
 
 #include "Config.h"
 #include "AgentConfig.h"
+#include "collectors/SystemCollector.h"
+#include "collectors/ProcessCollector.h"
+#include "collectors/TargetCollector.h"
 #include "grpc/GrpcClient.h"
+#include "util/StrUtil.h"
 
 namespace {
 
-std::string wideToUtf8(const wchar_t* w) {
-    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 1) {
-        return "";
+using StrUtil::wideToUtf8;
+
+// 개발용 타겟 등록: `SysMonitorAgent.exe --target <이름> [--target <이름> ...]`
+// 정식 등록 경로는 통합 Web UI → 서버 → 역방향 명령(기획노트 §4, Phase 7)이라 agent.ini에는 두지 않는다 —
+// Phase 3 체크포인트(타겟 수치 수신 확인)를 위한 임시 경로이며 Phase 7에서 제거한다.
+// main()의 argv는 ANSI(CP949)라 한글 이름이 깨지므로 wide 명령줄을 직접 읽어 UTF-8로 바꾼다 (Phase 3-0).
+// 이름 정규화(".exe" 제거, 대소문자 무시 중복 판정)는 TargetCollector::registerTarget()이 한 곳에서 한다 —
+// Phase 7 역방향 명령으로 들어오는 이름도 같은 규칙을 거치도록 여기서는 손대지 않는다.
+// 모르는 인자·값 없는 --target은 오타가 조용히 무시되지 않도록 기동을 중단시킨다 (nullopt).
+std::optional<std::vector<std::string>> parseTargetArgs() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) {
+        spdlog::error("[SysMonitorAgent] could not read command line (error {})", GetLastError());
+        return std::nullopt;
     }
-    std::string out(static_cast<size_t>(len - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
-    return out;
+
+    std::vector<std::string> names;
+    bool ok = true;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = wideToUtf8(argv[i]);
+        if (arg != "--target") {
+            spdlog::error("[SysMonitorAgent] unknown argument '{}' (usage: SysMonitorAgent.exe [--target <name>]...)", arg);
+            ok = false;
+            break;
+        }
+        if (i + 1 >= argc || argv[i + 1][0] == L'\0') {
+            spdlog::error("[SysMonitorAgent] --target needs a process name (e.g. --target notepad)");
+            ok = false;
+            break;
+        }
+        names.push_back(wideToUtf8(argv[++i]));
+    }
+    LocalFree(argv);
+
+    if (!ok) {
+        return std::nullopt;
+    }
+    return names;
 }
 
 // gRPC metadata 값은 출력 가능한 ASCII(0x20~0x7E)만 허용한다 — 그 밖의 바이트(예: 한글 컴퓨터 이름)는 %XX로 바꾼다.
@@ -86,12 +123,18 @@ bool shouldContinue(ClientResult result, const char* stage) {
 
 } // namespace
 
-// Phase 2 체크포인트: agent.ini에서 agent_id/api_key를 읽어 gRPC metadata로 전송하고,
-// 서버가 잘못된 api_key를 가진 연결을 거부하는지 확인한다.
+// Phase 3: 실제 수집기(sys / proc 전체 / target)의 스냅샷을 1초마다 실시간 채널로 보낸다.
+// 수집 순서·주기는 원본 SysMonitor의 메인 루프와 같다. 로컬 DuckDB(DataStore)는 끊김 동안의 버퍼 역할로
+// Phase 4-3에서 붙인다 (기획노트 §3) — 그 전까지 연결이 끊기면 종료한다.
 int main() {
     // 소스는 UTF-8(/utf-8)로 컴파일되지만 Windows 콘솔 기본 코드페이지는 CP949라
     // 로그의 한글이 깨져 보인다. 콘솔 출력 코드페이지를 UTF-8로 맞춰 해결한다.
     SetConsoleOutputCP(CP_UTF8);
+
+    std::optional<std::vector<std::string>> targetNames = parseTargetArgs();
+    if (!targetNames) {
+        return 1;   // 원인은 parseTargetArgs()가 이미 로그로 남김
+    }
 
     std::optional<AgentConfig> config = AgentConfig::load("agent.ini");
     if (!config) {
@@ -105,14 +148,43 @@ int main() {
     const std::string instanceId = readInstanceId();
     spdlog::info("[SysMonitorAgent] starting, agent_id={}, instance_id={}", config->agentId, instanceId);
 
+    // 인증·프로토콜 버전 오류는 수집기(ETW 세션 등)를 띄우기 전에 빨리 드러나도록 연결을 먼저 한다.
     GrpcClient client(config->serverUrl, config->agentId, config->apiKey, instanceId);
     if (!shouldContinue(client.connect(), "connect")) {
         return 1;
     }
 
+    // ETW 세션은 ProcessCollector가 소유하고 TargetCollector가 공유한다 (프로세스별 네트워크 사용량 — 관리자 권한 필요,
+    // 없으면 경고만 남고 네트워크 값이 0으로 나간다). SystemCollector 생성자는 PDH 기준점을 잡느라 1초 대기한다.
+    SystemCollector sysCollector;
+    ProcessCollector procCollector;
+    TargetCollector targetCollector(procCollector.getEtwNet());
+
+    // 여기는 메인 루프 스레드이므로 registerTarget()을 직접 불러도 된다 (다른 스레드는 requestRegister() 경유).
+    for (const auto& name : *targetNames) {
+        targetCollector.registerTarget(name);
+    }
+
     int tick = 0;
     while (true) {
-        if (!shouldContinue(client.sendRealtimeDummy(), "realtime")) {
+        const auto loopStart = std::chrono::steady_clock::now();
+
+        // 다른 스레드가 큐에 넣은 타겟 등록/해제 요청을 이 스레드에서 반영한다 (Phase 7 역방향 명령이 쓸 경로)
+        targetCollector.applyPending();
+
+        // 1초 주기 수집
+        sysCollector.collectMiddle();
+        procCollector.collectProc();
+        targetCollector.collect();
+        if (tick % Config::SLOW_COLLECT_INTERVAL == 0) {
+            sysCollector.collectSlow();   // 2초 주기 (디스크)
+        }
+
+        // 원본은 여기서 종료된 타겟의 마지막 세션 요약을 로컬 DuckDB(SessionReport)로 계산해 넣었다.
+        // 로컬 DB는 Phase 4-3에서 붙으므로, 그 전까지 종료된 타겟은 요약 없이 NEVER_SEEN으로 보고된다.
+        targetCollector.clearPendingDeactivated();
+
+        if (!shouldContinue(client.sendRealtime(sysCollector.makeSnapshot(), procCollector.makeSnapshot(), targetCollector.getSnapshot()), "realtime")) {
             return 1;
         }
 
@@ -125,6 +197,14 @@ int main() {
         }
 
         ++tick;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        // 수집·전송에 쓴 시간을 빼고 남은 시간만 기다려 1초 주기를 유지한다. 그 사이 타겟 등록/해제 요청이 들어오면
+        // 즉시 깨어나 반영한 뒤 deadline까지 다시 기다린다 (원본 SysMonitor와 같은 방식).
+        const auto deadline = loopStart + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (targetCollector.waitForPendingUntil(deadline)) {
+                targetCollector.applyPending();
+            }
+        }
     }
 }

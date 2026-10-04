@@ -79,7 +79,8 @@ private:
 // -------------------------------------------------------
 // ProcessCollector
 //
-// PDH 와일드카드(*) 기반으로 전체 프로세스 수집
+// PDH 와일드카드(*) 기반으로 전체 프로세스 수집 — 이름으로 걸러 내지 않는다 (PID 0의 의사 항목만 제외).
+// 이름은 ".exe"를 뗀 실행 파일 이름 (StrUtil::exeBaseName, 타겟과 같은 표기)
 // 같은 이름 프로세스(#N)는 메인에 합산
 //
 // 수집 항목
@@ -122,9 +123,6 @@ private:
     // --- 헬퍼 ---
     // Counter 초기화
     void initInfo(PDH_HQUERY& query);
-
-    // 시스템 프로세스 필터
-    bool isSystemProcess(const std::string& name) const;
 
     // 카운터 포맷
     std::vector<char> getCountArray(PDH_HCOUNTER hCounter, DWORD& count);

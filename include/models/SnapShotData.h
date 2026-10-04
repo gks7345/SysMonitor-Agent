@@ -3,6 +3,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdint> 
+#include <optional>
 
 // ---------------------------------------------------------------------------
 // 시스템
@@ -82,13 +83,15 @@ struct TargetNetConnection {
 	std::string state;		 // ESTABLISHED, LISTEN 등
 };
 
+// std::optional 필드 (SnapshotChildProcess / SnapshotTarget 공통): 값이 없으면 "수집하지 못함"이다 —
+// 그 프로세스를 열 권한이 없을 때 등. 0은 실제로 0일 때만 넣는다 (proto의 optional 필드와 1:1, Phase 3 리뷰 High #5).
 struct SnapshotChildProcess {
 	uint32_t pid = 0;
 	std::string processName;
 
 	// 기본 지표
 	double cpuUsage = 0.0;
-	double memoryMB = 0.0;
+	std::optional<double> memoryMB;		// Working Set - Private
 	double privateMemoryMB = 0.0;
 	double virtualMemoryMB = 0.0;
 	double diskReadMBs = 0.0;
@@ -99,19 +102,27 @@ struct SnapshotChildProcess {
 	// 리소스
 	uint32_t threadCount = 0;
 	uint32_t handleCount = 0;
-	uint32_t gdiObjectCount = 0;
+	std::optional<uint32_t> gdiObjectCount;
 	double   pageFaultRate = 0.0;
 
 	// 네트워크 연결
 	std::vector<TargetNetConnection> connections;
 };
 
+// 타겟 상태 — TargetCollector::getStatus()와 SnapshotTarget::status가 함께 쓰는 유일한 정의 (proto TargetInfo::Status와 1:1).
+// 값을 추가하면 default 없는 switch(SnapshotConverter 등)에서 C4062 경고가 난다 (src/CMakeLists.txt의 /w14062).
+enum class TargetStatus {
+	RUNNING,      // 실행 중 → 실시간 수집
+	NOT_RUNNING,  // 꺼져 있음 → 마지막 데이터 표시
+	NEVER_SEEN    // 한 번도 수집된 적 없음
+};
+
 struct SnapshotTarget {
 	std::string targetName;
-	std::string exePath;
-	std::string status = "running"; // 메인 루프가 수집 시점에 계산: "running" | "not_running" | "never_seen"
+	std::optional<std::string> exePath;
+	TargetStatus status = TargetStatus::RUNNING; // 메인 루프가 수집 시점에 계산
 
-	// status가 "not_running"/"never_seen"일 때만 채워지는 마지막 세션 요약 (running이면 전부 기본값)
+	// status가 NOT_RUNNING/NEVER_SEEN일 때만 채워지는 마지막 세션 요약 (RUNNING이면 전부 기본값)
 	std::string lastSessionDate;
 	double lastAvgCpuUsage = 0.0;
 	double lastPeakCpuUsage = 0.0;
@@ -125,8 +136,9 @@ struct SnapshotTarget {
 
 	// 메인 프로세스
 	uint32_t pid = 0;
+	std::string processName;	// 실제 실행 파일 이름(.exe 제외) — 이름 매칭이 대소문자를 무시하므로 targetName과 대소문자가 다를 수 있다
 	double cpuUsage = 0.0;
-	double memoryMB = 0.0;
+	std::optional<double> memoryMB;		// Working Set - Private
 	double privateMemoryMB = 0.0;
 	double virtualMemoryMB = 0.0;
 	double diskReadMBs = 0.0;
@@ -135,7 +147,7 @@ struct SnapshotTarget {
 	double netRecvMbps = 0.0;
 	uint32_t threadCount = 0;
 	uint32_t handleCount = 0;
-	uint32_t gdiObjectCount = 0;
+	std::optional<uint32_t> gdiObjectCount;
 	double pageFaultRate = 0.0;
 	double elapsedSec = 0.0;
 
@@ -145,7 +157,8 @@ struct SnapshotTarget {
 	// 자식 프로세스
 	std::vector<SnapshotChildProcess> children;
 
-	// 전체 합계 (메인 + 자식)
+	// 전체 합계 (메인 + 자식) — 서버로는 보내지 않는다.
+	// totalMemoryMB는 메모리를 수집하지 못한 프로세스를 0으로 더하므로, 그런 프로세스가 있으면 실제보다 작다.
 	double totalCpuUsage = 0.0;
 	double totalMemoryMB = 0.0;
 	double totalDiskMBs = 0.0;  // Read + Write
@@ -156,7 +169,7 @@ struct SnapshotTarget {
 
 	void calcTotals() {
 		totalCpuUsage = cpuUsage;
-		totalMemoryMB = memoryMB;
+		totalMemoryMB = memoryMB.value_or(0.0);
 		totalDiskMBs = diskReadMBs + diskWriteMBs;
 		totalNetMbps = netSentMbps + netRecvMbps;
 		totalThreadCount = threadCount;
@@ -165,7 +178,7 @@ struct SnapshotTarget {
 
 		for (const auto& c : children) {
 			totalCpuUsage += c.cpuUsage;
-			totalMemoryMB += c.memoryMB;
+			totalMemoryMB += c.memoryMB.value_or(0.0);
 			totalDiskMBs += c.diskReadMBs + c.diskWriteMBs;
 			totalNetMbps += c.netSentMbps + c.netRecvMbps;
 			totalThreadCount += c.threadCount;
