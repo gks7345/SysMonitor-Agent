@@ -84,26 +84,27 @@ struct TargetNetConnection {
 };
 
 // std::optional 필드 (SnapshotChildProcess / SnapshotTarget 공통): 값이 없으면 "수집하지 못함"이다 —
-// 그 프로세스를 열 권한이 없을 때 등. 0은 실제로 0일 때만 넣는다 (proto의 optional 필드와 1:1, Phase 3 리뷰 High #5).
+// 그 프로세스를 열 권한이 없을 때, 비율 값(CPU·디스크·페이지 폴트)을 아직 계산할 수 없는 첫 틱,
+// 그 틱에 PDH가 값을 주지 않았을 때. 0은 실제로 0일 때만 넣는다 (proto의 optional 필드와 1:1, Phase 3 리뷰 High #5).
 struct SnapshotChildProcess {
 	uint32_t pid = 0;
 	std::string processName;
 
 	// 기본 지표
-	double cpuUsage = 0.0;
+	std::optional<double> cpuUsage;
 	std::optional<double> memoryMB;		// Working Set - Private
-	double privateMemoryMB = 0.0;
-	double virtualMemoryMB = 0.0;
-	double diskReadMBs = 0.0;
-	double diskWriteMBs = 0.0;
+	std::optional<double> privateMemoryMB;
+	std::optional<double> virtualMemoryMB;
+	std::optional<double> diskReadMBs;
+	std::optional<double> diskWriteMBs;
 	double netSentMbps = 0.0;
 	double netRecvMbps = 0.0;
 
 	// 리소스
-	uint32_t threadCount = 0;
-	uint32_t handleCount = 0;
+	std::optional<uint32_t> threadCount;
+	std::optional<uint32_t> handleCount;
 	std::optional<uint32_t> gdiObjectCount;
-	double   pageFaultRate = 0.0;
+	std::optional<double> pageFaultRate;
 
 	// 네트워크 연결
 	std::vector<TargetNetConnection> connections;
@@ -137,19 +138,19 @@ struct SnapshotTarget {
 	// 메인 프로세스
 	uint32_t pid = 0;
 	std::string processName;	// 실제 실행 파일 이름(.exe 제외) — 이름 매칭이 대소문자를 무시하므로 targetName과 대소문자가 다를 수 있다
-	double cpuUsage = 0.0;
+	std::optional<double> cpuUsage;
 	std::optional<double> memoryMB;		// Working Set - Private
-	double privateMemoryMB = 0.0;
-	double virtualMemoryMB = 0.0;
-	double diskReadMBs = 0.0;
-	double diskWriteMBs = 0.0;
+	std::optional<double> privateMemoryMB;
+	std::optional<double> virtualMemoryMB;
+	std::optional<double> diskReadMBs;
+	std::optional<double> diskWriteMBs;
 	double netSentMbps = 0.0;
 	double netRecvMbps = 0.0;
-	uint32_t threadCount = 0;
-	uint32_t handleCount = 0;
+	std::optional<uint32_t> threadCount;
+	std::optional<uint32_t> handleCount;
 	std::optional<uint32_t> gdiObjectCount;
-	double pageFaultRate = 0.0;
-	double elapsedSec = 0.0;
+	std::optional<double> pageFaultRate;
+	std::optional<double> elapsedSec;
 
 	// 네트워크 연결 목록
 	std::vector<TargetNetConnection> connections;
@@ -158,7 +159,7 @@ struct SnapshotTarget {
 	std::vector<SnapshotChildProcess> children;
 
 	// 전체 합계 (메인 + 자식) — 서버로는 보내지 않는다.
-	// totalMemoryMB는 메모리를 수집하지 못한 프로세스를 0으로 더하므로, 그런 프로세스가 있으면 실제보다 작다.
+	// 값이 있는 것만 더한다: 값을 수집하지 못한 프로세스가 섞여 있으면(자식이 새로 생긴 틱 등) 합계는 그만큼 실제보다 작다.
 	double totalCpuUsage = 0.0;
 	double totalMemoryMB = 0.0;
 	double totalDiskMBs = 0.0;  // Read + Write
@@ -168,21 +169,21 @@ struct SnapshotTarget {
 	uint32_t totalProcessCount = 0;    // 메인 + 자식 수
 
 	void calcTotals() {
-		totalCpuUsage = cpuUsage;
+		totalCpuUsage = cpuUsage.value_or(0.0);
 		totalMemoryMB = memoryMB.value_or(0.0);
-		totalDiskMBs = diskReadMBs + diskWriteMBs;
+		totalDiskMBs = diskReadMBs.value_or(0.0) + diskWriteMBs.value_or(0.0);
 		totalNetMbps = netSentMbps + netRecvMbps;
-		totalThreadCount = threadCount;
-		totalHandleCount = handleCount;
+		totalThreadCount = threadCount.value_or(0);
+		totalHandleCount = handleCount.value_or(0);
 		totalProcessCount = 1 + static_cast<uint32_t>(children.size());
 
 		for (const auto& c : children) {
-			totalCpuUsage += c.cpuUsage;
+			totalCpuUsage += c.cpuUsage.value_or(0.0);
 			totalMemoryMB += c.memoryMB.value_or(0.0);
-			totalDiskMBs += c.diskReadMBs + c.diskWriteMBs;
+			totalDiskMBs += c.diskReadMBs.value_or(0.0) + c.diskWriteMBs.value_or(0.0);
 			totalNetMbps += c.netSentMbps + c.netRecvMbps;
-			totalThreadCount += c.threadCount;
-			totalHandleCount += c.handleCount;
+			totalThreadCount += c.threadCount.value_or(0);
+			totalHandleCount += c.handleCount.value_or(0);
 		}
 	}
 };

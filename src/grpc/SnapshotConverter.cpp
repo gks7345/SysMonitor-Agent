@@ -38,18 +38,18 @@ namespace {
     template <typename T>
     void fillCommon(const T& src, sysmonitor::TargetProcess* dst) {
         dst->set_pid(src.pid);
-        dst->set_cpu_usage(src.cpuUsage);
+        if (src.cpuUsage) dst->set_cpu_usage(*src.cpuUsage);
         if (src.memoryMB) dst->set_memory_mb(*src.memoryMB);
-        dst->set_private_memory_mb(src.privateMemoryMB);
-        dst->set_virtual_memory_mb(src.virtualMemoryMB);
-        dst->set_disk_read_mbs(src.diskReadMBs);
-        dst->set_disk_write_mbs(src.diskWriteMBs);
+        if (src.privateMemoryMB) dst->set_private_memory_mb(*src.privateMemoryMB);
+        if (src.virtualMemoryMB) dst->set_virtual_memory_mb(*src.virtualMemoryMB);
+        if (src.diskReadMBs) dst->set_disk_read_mbs(*src.diskReadMBs);
+        if (src.diskWriteMBs) dst->set_disk_write_mbs(*src.diskWriteMBs);
         dst->set_net_sent_mbps(src.netSentMbps);
         dst->set_net_recv_mbps(src.netRecvMbps);
-        dst->set_thread_count(src.threadCount);
-        dst->set_handle_count(src.handleCount);
+        if (src.threadCount) dst->set_thread_count(*src.threadCount);
+        if (src.handleCount) dst->set_handle_count(*src.handleCount);
         if (src.gdiObjectCount) dst->set_gdi_object_count(*src.gdiObjectCount);
-        dst->set_page_fault_rate(src.pageFaultRate);
+        if (src.pageFaultRate) dst->set_page_fault_rate(*src.pageFaultRate);
         fillConnections(src.connections, dst);
     }
 } // namespace
@@ -124,7 +124,7 @@ sysmonitor::AgentData toAgentData(const std::string& agentId, const SnapshotTarg
             sysmonitor::TargetProcess* main = info->mutable_main();
             fillCommon(t, main);
             main->set_name(t.processName);   // 실제 실행 파일 이름(.exe 제외) — 대소문자가 등록 이름(info.name)과 다를 수 있다
-            info->set_elapsed_sec(t.elapsedSec);
+            if (t.elapsedSec) info->set_elapsed_sec(*t.elapsedSec);
 
             info->mutable_children()->Reserve(static_cast<int>(t.children.size()));
             for (const auto& c : t.children) {
