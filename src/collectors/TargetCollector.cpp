@@ -367,6 +367,19 @@ void TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> 
 }
 
 // -------------------------------------------------------
+// ETW 네트워크 값 — PID당 틱에 한 번만 읽는다
+// getAndResetForTarget()은 읽으면서 누적값을 0으로 되돌린다. 등록된 타겟이 다른 타겟의 자손이기도 하면
+// 같은 PID가 한 틱에 두 번 수집되는데, 그대로 두 번 읽으면 두 번째는 0이 된다.
+// -------------------------------------------------------
+NetMbps TargetCollector::readNet(DWORD pid, double elapsedSec) {
+	auto it = netThisTick.find(pid);
+	if (it != netThisTick.end()) return it->second;
+	const NetMbps net = etwNet.getAndResetForTarget(pid, elapsedSec);
+	netThisTick.emplace(pid, net);
+	return net;
+}
+
+// -------------------------------------------------------
 // 자식 프로세스 수집
 // -------------------------------------------------------
 SnapshotChildProcess TargetCollector::collectChild(const TrackedProcess& child, const ProcessPerf* perf, double elapsedSec, const ConnectionMap& connMap, bool& accessDenied) {
@@ -380,7 +393,7 @@ SnapshotChildProcess TargetCollector::collectChild(const TrackedProcess& child, 
 	fillPerf(c, perf, opened.accessDenied, cores);
 	c.gdiObjectCount = opened.gdiObjectCount;
 
-	NetMbps net = etwNet.getAndResetForTarget(child.pid, elapsedSec);
+	const NetMbps net = readNet(child.pid, elapsedSec);
 	c.netSentMbps = net.sentMbps;
 	c.netRecvMbps = net.recvMbps;
 	c.connections = lookupConnections(connMap, child.pid);
@@ -414,7 +427,7 @@ SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsed
 	s.gdiObjectCount = opened.gdiObjectCount;
 
 	// ETW 네트워크
-	NetMbps net = etwNet.getAndResetForTarget(entry.pid, elapsedSec);
+	const NetMbps net = readNet(entry.pid, elapsedSec);
 	s.netSentMbps = net.sentMbps;
 	s.netRecvMbps = net.recvMbps;
 	s.connections = lookupConnections(connMap, entry.pid);
@@ -485,23 +498,41 @@ void TargetCollector::deactivateTarget(const std::string& name, bool notifyPendi
 
 // -------------------------------------------------------
 // 자식 프로세스 동기화
+// 타겟의 "자식"은 메인 프로세스의 자손 전체다 — 자식의 자식까지 따라가 entry.children에 평평하게 담는다.
+// 셸이나 런처를 거쳐 실행된 프로그램(메인 → cmd → 실제 작업 프로세스)도 타겟의 자원 사용에 포함된다.
+// 값은 와일드카드 배열에서 PID로 찾으므로 자손이 늘어도 수집 비용은 거의 그대로다.
 // -------------------------------------------------------
 void TargetCollector::syncChildren(TargetEntry& entry, const ProcessList& procs) {
-	// 종료된 자식 제거 — 목록에 "같은 PID + 같은 이름"이 없으면 종료로 본다 (isAlive 규칙).
+	// 종료된 자손 제거 — 목록에 "같은 PID + 같은 이름"이 없으면 종료로 본다 (isAlive 규칙).
 	// 추가보다 먼저 한다: PID가 다른 프로세스에 재사용된 경우 옛 항목을 지워야 아래에서 새 프로세스로 다시 볼 수 있다.
+	// 한 번 잡힌 자손은 살아 있는 동안 유지한다 — 중간 프로세스가 먼저 종료돼(cmd는 끝나고 작업 프로세스만 남음)
+	// 메인에서 더 이상 따라갈 수 없게 돼도 빼지 않는다.
 	entry.children.erase(std::remove_if(entry.children.begin(), entry.children.end(),
 		[&](const TrackedProcess& c) { return !isAlive(procs, c.pid, c.exeName); }), entry.children.end());
 
-	// 새 자식 추가 — collect()가 뜬 프로세스 목록에서 부모가 이 타겟의 메인인 것을 고른다 (스냅샷을 따로 뜨지 않는다).
-	// 실행 파일이 부모와 달라도 자식이다 (스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등).
-	for (const auto& p : procs) {
-		if (p.ppid != entry.pid || p.pid == entry.pid) continue;
+	// 새 자손 추가 — collect()가 뜬 프로세스 목록에서 메인부터 부모 PID를 따라 내려간다 (스냅샷을 따로 뜨지 않는다).
+	// 실행 파일이 부모와 달라도 포함한다 (스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등).
+	//
+	// 한계: Windows는 부모가 종료돼도 자식에 기록된 부모 PID를 고치지 않는다. 죽은 프로세스의 PID를
+	// 이 타겟의 메인이나 자손이 물려받으면, 그 죽은 프로세스의 자식이 여기서 자손으로 잘못 잡힐 수 있다.
+	// 프로세스 생성 시각을 비교하면 막을 수 있지만 ToolHelp 목록에는 생성 시각이 없다.
+	std::vector<DWORD> frontier{ entry.pid };
+	std::unordered_set<DWORD> visited{ entry.pid };	// 같은 PID를 두 번 따라가지 않는다 (부모 관계가 순환해 보여도 끝난다)
+	while (!frontier.empty()) {
+		const DWORD parent = frontier.back();
+		frontier.pop_back();
 
-		bool exists = std::any_of(entry.children.begin(), entry.children.end(),
-			[&](const TrackedProcess& c) { return c.pid == p.pid; });
-		if (exists) continue;
+		for (const auto& p : procs) {
+			if (p.ppid != parent) continue;
+			if (!visited.insert(p.pid).second) continue;
+			frontier.push_back(p.pid);
 
-		entry.children.push_back(TrackedProcess{ p.pid, StrUtil::wideToUtf8(p.exeName) });
+			bool exists = std::any_of(entry.children.begin(), entry.children.end(),
+				[&](const TrackedProcess& c) { return c.pid == p.pid; });
+			if (exists) continue;
+
+			entry.children.push_back(TrackedProcess{ p.pid, StrUtil::wideToUtf8(p.exeName) });
+		}
 	}
 }
 
@@ -565,6 +596,7 @@ void TargetCollector::collect() {
 	std::vector<std::string> deadTargets;
 
 	auto connMap = getAllConnectionsGroupedByPid();
+	netThisTick.clear();
 	for (auto& entry : activeTargets) {
 		// 생존은 프로세스 목록으로만 판정한다 — OpenProcess 성공은 "실행 중"이 아니고(핸들이 남은 종료 프로세스),
 		// 실패는 "종료"가 아니다(권한 부족). 목록을 못 받은 틱(procs 없음)은 직전 상태(실행 중)를 유지한다.

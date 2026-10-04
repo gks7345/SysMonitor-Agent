@@ -60,7 +60,7 @@ struct TargetEntry {
 	std::string exeName;		// 메인 프로세스의 실제 실행 파일 이름(.exe 제외, OS가 준 대소문자 그대로).
 								// 매칭은 대소문자를 무시하므로 targetName과 대소문자가 다를 수 있다 (예: notepad / Notepad)
 	DWORD pid = 0;				// 메인 프로세스
-	std::vector<TrackedProcess> children;	// 자식 프로세스들
+	std::vector<TrackedProcess> children;	// 메인의 자손 전체 (자식의 자식까지, 평평하게) — syncChildren()이 관리
 	bool limitedAccessWarned = false;	// "권한이 없어 일부 지표를 수집하지 못함" 경고를 이미 남겼는가 (활성화당 1번)
 };
 
@@ -83,6 +83,7 @@ private:
 	std::vector<PDH_HCOUNTER> perfCounters;	// 등록에 실패한 카운터는 nullptr (그 지표는 계속 "없음")
 	std::vector<char> perfBuffer;			// 배열 읽기용 버퍼 — 매 틱 다시 할당하지 않고 재사용
 	bool perfCollectedLastTick = false;		// 직전 틱에 수집했는가 — 아니면 이번 수집의 비율 값은 쓸 수 없다
+	std::unordered_map<DWORD, NetMbps> netThisTick;	// 이번 틱에 이미 읽은 ETW 네트워크 값 (readNet)
 
 	ETWNetwork& etwNet;
 
@@ -159,8 +160,10 @@ private:
 	ConnectionMap getAllConnectionsGroupedByPid();
 	std::vector<TargetNetConnection> lookupConnections(const ConnectionMap& map, DWORD pid);
 
-	// 자식 목록 동기화 — collect()의 프로세스 목록에서 부모가 타겟 메인인 것을 추가하고, 목록에서 사라진 자식을 제거한다
+	// 자손 목록 동기화 — collect()의 프로세스 목록에서 메인의 자손(자식의 자식까지)을 추가하고, 목록에서 사라진 것을 제거한다
 	void syncChildren(TargetEntry& entry, const ProcessList& procs);
+	// ETW 네트워크 값을 PID당 틱에 한 번만 읽는다 (읽으면 누적값이 리셋되므로 — 같은 PID가 두 타겟에 걸칠 수 있다)
+	NetMbps readNet(DWORD pid, double elapsedSec);
 
 	// 실행 중인 프로세스 목록 (CreateToolhelp32Snapshot) — collect()가 틱당 1번 떠서
 	// 비활성 타겟 찾기(findRunningPids), 메인·자식의 생존 확인(isAlive), 자식 목록 동기화(syncChildren)가 함께 쓴다.
