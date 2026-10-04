@@ -11,7 +11,7 @@ add_library (SysMonitorAgentCore STATIC
 	"collectors/ProcessCollector.cpp" "collectors/ETWNetwork.cpp" "collectors/TargetCollector.cpp"
 	"datastore/DataStore.cpp" "datastore/SummaryStore.cpp"
 	"analysis/SessionReport.cpp"
-	"util/StrUtil.cpp")
+	"util/StrUtil.cpp" "util/ProcessList.cpp")
 target_include_directories(SysMonitorAgentCore PUBLIC "../include")
 
 target_compile_definitions(SysMonitorAgentCore PRIVATE

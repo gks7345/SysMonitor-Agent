@@ -28,6 +28,7 @@
 #include "collectors/ETWNetwork.h"
 #include "models/SnapshotData.h"
 #include "models/SessionSummary.h"
+#include "util/ProcessList.h"
 
 
 #pragma comment(lib, "pdh.lib")
@@ -116,14 +117,6 @@ private:
 	std::condition_variable pendingCv;
 	std::unordered_map<std::string, PendingCommand> pendingByName;
 
-	// snapshotProcesses() 결과 한 건: 이번 틱에 실행 중인 프로세스
-	struct ProcessListEntry {
-		DWORD pid = 0;
-		DWORD ppid = 0;			// 부모 PID — syncChildren()이 타겟의 자식을 고를 때 쓴다
-		std::wstring exeName;	// 실행 파일 이름(.exe 제외, OS가 준 그대로)
-	};
-	using ProcessList = std::vector<ProcessListEntry>;
-
 	// findRunningPids() 결과 한 건: 등록 이름에 매칭된 실행 중 프로세스
 	struct RunningProcess {
 		DWORD pid = 0;
@@ -151,7 +144,7 @@ private:
 	// 카운터 하나의 배열을 읽어 wanted에 든 PID의 값을 out의 field에 채운다
 	void readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out);
 
-	// procs: collect()가 이번 틱에 뜬 프로세스 목록 — 자식의 생존 판정에 쓴다. nullptr = 이번 틱은 목록을 못 받음(자식을 그대로 수집)
+	// procs: 이번 틱의 프로세스 목록 — 자식의 생존 판정에 쓴다. nullptr = 이번 틱은 목록을 못 받음(자식을 그대로 수집)
 	// perf: 이번 틱의 PDH 값. nullptr = PDH 수집 실패(값을 모두 비운 채 보낸다)
 	SnapshotTarget collectTarget(TargetEntry& entry, double elapsedSec, const ConnectionMap& connMap, const ProcessList* procs, const PerfMap* perf);
 	// accessDenied: 이 자식을 열 권한이 없었으면 true로 바꾼다 (false로 되돌리지는 않음 — 여러 자식의 결과를 모으는 용도)
@@ -160,18 +153,11 @@ private:
 	ConnectionMap getAllConnectionsGroupedByPid();
 	std::vector<TargetNetConnection> lookupConnections(const ConnectionMap& map, DWORD pid);
 
-	// 자손 목록 동기화 — collect()의 프로세스 목록에서 메인의 자손(자식의 자식까지)을 추가하고, 목록에서 사라진 것을 제거한다
+	// 자손 목록 동기화 — 이번 틱의 프로세스 목록에서 메인의 자손(자식의 자식까지)을 추가하고, 목록에서 사라진 것을 제거한다
 	void syncChildren(TargetEntry& entry, const ProcessList& procs);
 	// ETW 네트워크 값을 PID당 틱에 한 번만 읽는다 (읽으면 누적값이 리셋되므로 — 같은 PID가 두 타겟에 걸칠 수 있다)
 	NetMbps readNet(DWORD pid, double elapsedSec);
 
-	// 실행 중인 프로세스 목록 (CreateToolhelp32Snapshot) — collect()가 틱당 1번 떠서
-	// 비활성 타겟 찾기(findRunningPids), 메인·자식의 생존 확인(isAlive), 자식 목록 동기화(syncChildren)가 함께 쓴다.
-	// TargetCollector 안에서 CreateToolhelp32Snapshot을 부르는 곳은 여기 하나다.
-	// 권한이 필요 없고, 종료된 프로세스는 다른 프로세스가 핸들을 쥐고 있어도 목록에서 빠진다
-	// (OpenProcess는 두 경우 모두 틀린 답을 준다).
-	// nullopt = 스냅샷 자체가 실패(생존 여부 판단 불가) — 빈 목록("아무것도 실행 중이 아님")과 구분한다.
-	static std::optional<ProcessList> snapshotProcesses();
 	// 등록됐지만 아직 활성화되지 않은 이름들(notActiveNames)을 프로세스 목록 하나와 한 번에 대조한다.
 	// 반환값: 이번 틱에 실제로 발견된 이름만 담긴 {등록 이름 -> {PID, 실제 실행 파일 이름}} 맵.
 	static std::unordered_map<std::string, RunningProcess> findRunningPids(const ProcessList& procs, const std::vector<std::string>& notActiveNames);
@@ -223,7 +209,9 @@ public:
 	void clearPendingDeactivated() { pendingDeactivated.clear(); }
 
 
-	void collect();
+	// procs: 메인 루프가 이번 틱에 뜬 프로세스 목록 (takeProcessList) — 시작 감지, 메인·자손의 생존 확인, 자손 동기화가 함께 쓴다.
+	// nullopt(목록을 못 받음)이면 이번 틱은 시작/종료 판정을 모두 건너뛰고 직전 상태를 유지한다.
+	void collect(const std::optional<ProcessList>& procs);
 
 	// 결과 조회
 	const SnapshotTargetData& getSnapshot() const { return snapshot; }

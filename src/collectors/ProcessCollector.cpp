@@ -116,7 +116,17 @@ std::vector<char> ProcessCollector::getCountArray(PDH_HCOUNTER hCounter, DWORD& 
 // ---------------------------------------------------------------------------
 // 1초 주기 수집
 // ---------------------------------------------------------------------------
-void ProcessCollector::collectProc() {
+void ProcessCollector::collectProc(const std::optional<ProcessList>& procs) {
+	procList.clear();
+	aggregatedProcList.clear();
+	PdhCollectQueryData(queryMiddle);	// 목록이 없어도 수집은 한다 — 비율 값의 기준점이 끊기지 않게
+
+	// 프로세스 목록을 못 받은 틱: PID에 이름을 붙일 수 없으므로 이번 틱의 proc 목록은 만들지 않는다.
+	// 빈 목록으로 내보내면 받는 쪽이 "프로세스가 하나도 없다"로 읽는다.
+	// lastTime을 그대로 두어, 그동안 쌓인 ETW 네트워크 바이트가 다음 틱에 실제 경과 시간으로 나뉘게 한다.
+	snapshotAvailable = procs.has_value();
+	if (!procs) return;
+
 	auto now = std::chrono::steady_clock::now();
 	double elapsedSec = std::chrono::duration <double>(now - lastTime).count();
 	lastTime = now;
@@ -124,18 +134,13 @@ void ProcessCollector::collectProc() {
 		elapsedSec = 1.0;
 	}
 
-
-	procList.clear();
-	aggregatedProcList.clear();
-	PdhCollectQueryData(queryMiddle);
-
 	// 1단계 - PID 배열 수집
 	DWORD pidItemCount = 0;
 	std::vector<char> pidbuffer = getCountArray(procIDMiddle, pidItemCount);
 	auto* pidItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(pidbuffer.data());
 
-	auto tree = buildProcTree();
-	// 2단계 - ToolHelp32로 PID -> 이름 맵 구성
+	auto tree = buildProcTree(*procs);
+	// 2단계 - 프로세스 목록으로 PID -> 이름 맵 구성
 	std::unordered_map<DWORD, std::string> pidToName;
 	for (const auto& [pid, entry] : tree) {
 		pidToName[pid] = entry.name;
@@ -284,26 +289,16 @@ void ProcessCollector::aggregateToParents(std::unordered_map<DWORD, ProcEntry>& 
 		aggregatedProcList.end());
 }
 
-std::unordered_map<DWORD, ProcEntry> ProcessCollector::buildProcTree() {
+std::unordered_map<DWORD, ProcEntry> ProcessCollector::buildProcTree(const ProcessList& procs) {
 	std::unordered_map<DWORD, ProcEntry> tree;
-
-	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snap == INVALID_HANDLE_VALUE) return tree;
-
-	// W 버전 + UTF-8 변환 — ANSI 버전은 코드 페이지에 없는 문자를 '?'로 바꾸고 한글을 CP949로 준다 (기획노트 Phase 3-0)
-	PROCESSENTRY32W entry = {};
-	entry.dwSize = sizeof(entry);
-
-	if (Process32FirstW(snap, &entry)) {
-		do {
-			ProcEntry pe;
-			pe.pid = entry.th32ProcessID;
-			pe.ppid = entry.th32ParentProcessID;
-			pe.name = StrUtil::wideToUtf8(StrUtil::exeBaseName(entry.szExeFile));	// ".exe" 없이 — 타겟 이름과 같은 표기
-			tree[pe.pid] = pe;
-		} while (Process32NextW(snap, &entry));
+	tree.reserve(procs.size());
+	for (const auto& p : procs) {
+		ProcEntry pe;
+		pe.pid = p.pid;
+		pe.ppid = p.ppid;
+		pe.name = StrUtil::wideToUtf8(p.exeName);	// 목록의 이름은 이미 ".exe"를 뗀 것 — 타겟 이름과 같은 표기
+		tree[pe.pid] = pe;
 	}
-	CloseHandle(snap);
 	return tree;
 }
 
@@ -312,7 +307,9 @@ void ProcessCollector::setTopN(int n) {
 	topN = n;
 }
 
-SnapshotProcData ProcessCollector::makeSnapshot() {
+std::optional<SnapshotProcData> ProcessCollector::makeSnapshot() {
+	if (!snapshotAvailable) return std::nullopt;
+
 	size_t count = aggregatedProcList.size();
 
 	SnapshotProcData snapshot;

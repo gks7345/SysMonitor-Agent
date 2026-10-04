@@ -169,15 +169,15 @@ ClientResult GrpcClient::connect() {
 }
 
 
-ClientResult GrpcClient::sendRealtime(const SnapshotSysData& sys, const SnapshotProcData& proc, const SnapshotTargetData& target) {
+ClientResult GrpcClient::sendRealtime(const SnapshotSysData& sys, const std::optional<SnapshotProcData>& proc, const SnapshotTargetData& target) {
     if (!impl_) {
         return ClientResult::Disconnected;   // moved-from 객체
     }
 
     // 스냅샷 1건 = 메시지 1개. 하나라도 실패하면 스트림은 이미 버려졌으므로 나머지는 변환도 전송도 하지 않는다.
     ClientResult result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, sys));
-    if (result == ClientResult::Ok) {
-        result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, proc));
+    if (result == ClientResult::Ok && proc) {
+        result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, *proc));
     }
     if (result == ClientResult::Ok) {
         result = writeOrFinish("realtime", impl_->realtimeStream, SnapshotConverter::toAgentData(agentId_, target));

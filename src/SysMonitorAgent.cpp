@@ -16,6 +16,7 @@
 #include "collectors/ProcessCollector.h"
 #include "collectors/TargetCollector.h"
 #include "grpc/GrpcClient.h"
+#include "util/ProcessList.h"
 #include "util/StrUtil.h"
 
 namespace {
@@ -174,8 +175,15 @@ int main() {
 
         // 1초 주기 수집
         sysCollector.collectMiddle();
-        procCollector.collectProc();
-        targetCollector.collect();
+
+        // 프로세스 목록은 틱당 1번 떠서 proc 목록과 타겟 수집이 함께 쓴다 (같은 시점의 목록, 스냅샷 1번).
+        // 못 받은 틱은 빈 목록으로 취급하지 않는다: proc 목록은 보내지 않고, 타겟은 직전 상태를 유지한다.
+        const std::optional<ProcessList> procs = takeProcessList();
+        if (!procs) {
+            spdlog::warn("[SysMonitorAgent] process snapshot failed (error {}) — proc list is not sent and target start/exit detection is skipped this tick", GetLastError());
+        }
+        procCollector.collectProc(procs);
+        targetCollector.collect(procs);
         if (tick % Config::SLOW_COLLECT_INTERVAL == 0) {
             sysCollector.collectSlow();   // 2초 주기 (디스크)
         }
