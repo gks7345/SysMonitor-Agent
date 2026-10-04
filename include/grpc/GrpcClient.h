@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <optional>
 
 #include "models/SnapShotData.h"
 
@@ -45,7 +46,8 @@ public:
 
     // 한 틱의 sys / proc / target 스냅샷을 실시간 채널로 한 건씩(메시지 3개) 전송한다 (스냅샷 1건 = 메시지 1개).
     // 스트림이 끊기면 서버가 보낸 최종 상태를 로그로 남기고 스트림을 버린다 — 이후 호출은 재연결 전까지 Disconnected.
-    ClientResult sendRealtime(const SnapshotSysData& sys, const SnapshotProcData& proc, const SnapshotTargetData& target);
+    // proc이 nullopt이면(이번 틱에 프로세스 목록을 만들지 못함) proc 메시지는 보내지 않는다 — 빈 목록으로 보내지 않는다.
+    ClientResult sendRealtime(const SnapshotSysData& sys, const std::optional<SnapshotProcData>& proc, const SnapshotTargetData& target);
 
     // 배치 채널 연결 확인용 더미 sys 스냅샷 1건을 전송한다. Phase 4-4에서 갭 전송으로 교체.
     // 실패 처리는 sendRealtime()과 같다.

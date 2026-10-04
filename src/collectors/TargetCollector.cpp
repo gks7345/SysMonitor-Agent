@@ -510,7 +510,7 @@ void TargetCollector::syncChildren(TargetEntry& entry, const ProcessList& procs)
 	entry.children.erase(std::remove_if(entry.children.begin(), entry.children.end(),
 		[&](const TrackedProcess& c) { return !isAlive(procs, c.pid, c.exeName); }), entry.children.end());
 
-	// 새 자손 추가 — collect()가 뜬 프로세스 목록에서 메인부터 부모 PID를 따라 내려간다 (스냅샷을 따로 뜨지 않는다).
+	// 새 자손 추가 — 이번 틱의 프로세스 목록에서 메인부터 부모 PID를 따라 내려간다 (스냅샷을 따로 뜨지 않는다).
 	// 실행 파일이 부모와 달라도 포함한다 (스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등).
 	//
 	// 한계: Windows는 부모가 종료돼도 자식에 기록된 부모 PID를 고치지 않는다. 죽은 프로세스의 PID를
@@ -539,7 +539,7 @@ void TargetCollector::syncChildren(TargetEntry& entry, const ProcessList& procs)
 // -------------------------------------------------------
 // 전체 수집
 // -------------------------------------------------------
-void TargetCollector::collect() {
+void TargetCollector::collect(const std::optional<ProcessList>& procs) {
 	// 등록된 타겟이 하나도 없어도 snapshot은 항상 "타겟 없음"으로 최신 상태를 반영해야 한다.
 	// 이 초기화를 아래 조기 반환보다 뒤에 두면, 마지막 타겟을 해제한 뒤에도 snapshot이
 	// 그 직전(심지어 running이었던) 상태로 얼어붙어 버려서 SysMonitor.cpp가 매 틱 그대로
@@ -564,14 +564,9 @@ void TargetCollector::collect() {
 		if (!isActive) notActiveNames.push_back(name);
 	}
 
-	// 프로세스 목록은 틱당 1번 — 비활성 타겟 찾기와 활성 타겟 생존 확인이 함께 쓴다.
-	// 실패하면 이번 틱은 시작/종료 판정을 모두 건너뛴다: "목록을 못 받음"을 "목록에 없음"으로 보면
+	// 프로세스 목록(procs)은 메인 루프가 틱당 1번 떠서 넘겨준다 — 비활성 타겟 찾기와 활성 타겟 생존 확인이 함께 쓴다.
+	// 목록을 못 받은 틱은 시작/종료 판정을 모두 건너뛴다: "목록을 못 받음"을 "목록에 없음"으로 보면
 	// 실행 중인 타겟이 전부 종료로 처리돼 세션이 거짓으로 끊긴다 (자식도 같은 원칙 — collectTarget() 참고).
-	const std::optional<ProcessList> procs = snapshotProcesses();
-	if (!procs) {
-		spdlog::warn("TargetCollector: process snapshot failed (error {}) — skipping start/exit detection this tick", GetLastError());
-	}
-
 	if (procs && !notActiveNames.empty()) {
 		auto runningPids = findRunningPids(*procs, notActiveNames);
 		for (const auto& name : notActiveNames) {
@@ -581,7 +576,7 @@ void TargetCollector::collect() {
 		}
 	}
 
-	// 자식 동기화 — 5초마다. 위에서 뜬 프로세스 목록을 그대로 쓴다.
+	// 자식 동기화 — 5초마다. 같은 프로세스 목록을 그대로 쓴다.
 	// 목록을 못 받은 틱에는 하지 않고 다음 틱에 다시 시도한다 (cleanupTick을 되돌리지 않음).
 	if (++cleanupTick >= 5 && procs) {
 		for (auto& entry : activeTargets)
@@ -645,27 +640,6 @@ void TargetCollector::collect() {
 		}
 		snapshot.targets.push_back(std::move(s));
 	}
-}
-
-// -------------------------------------------------------
-// 실행 중인 프로세스 목록 — collect()가 틱당 1번 떠서 시작 감지와 생존 확인이 함께 쓴다.
-// 이전에는 findMainPdhInstance()가 이름마다 개별로 스냅샷을 떠서, 등록된 이름이 K개면
-// 매 틱 스냅샷을 K번 뜨는 중복 비용이 있었다.
-// -------------------------------------------------------
-std::optional<TargetCollector::ProcessList> TargetCollector::snapshotProcesses() {
-	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snap == INVALID_HANDLE_VALUE) return std::nullopt;
-
-	ProcessList procs;
-	PROCESSENTRY32W entry = {};
-	entry.dwSize = sizeof(entry);
-	if (Process32FirstW(snap, &entry)) {
-		do {
-			procs.push_back(ProcessListEntry{ entry.th32ProcessID, entry.th32ParentProcessID, std::wstring(exeBaseName(entry.szExeFile)) });
-		} while (Process32NextW(snap, &entry));
-	}
-	CloseHandle(snap);
-	return procs;
 }
 
 std::unordered_map<std::string, TargetCollector::RunningProcess> TargetCollector::findRunningPids(const ProcessList& procs, const std::vector<std::string>& notActiveNames) {

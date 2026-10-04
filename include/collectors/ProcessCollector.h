@@ -14,10 +14,12 @@
 #include <memory>
 #include <unordered_map>
 #include <chrono>
+#include <optional>
 #include <spdlog/spdlog.h>
 
 #include "collectors/ETWNetwork.h"
 #include "models/SnapshotData.h"
+#include "util/ProcessList.h"
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")
@@ -127,7 +129,11 @@ private:
     // 카운터 포맷
     std::vector<char> getCountArray(PDH_HCOUNTER hCounter, DWORD& count);
 
-    std::unordered_map<DWORD, ProcEntry> buildProcTree();
+    // 프로세스 목록을 PID -> {부모 PID, 이름(UTF-8)} 표로 바꾼다 (스냅샷을 따로 뜨지 않는다)
+    static std::unordered_map<DWORD, ProcEntry> buildProcTree(const ProcessList& procs);
+
+    // 이번 틱의 proc 목록을 만들었는가 — 프로세스 목록을 못 받은 틱은 false (makeSnapshot이 nullopt)
+    bool snapshotAvailable = false;
 
     void aggregateToParents(std::unordered_map<DWORD, ProcEntry>& tree);
 
@@ -135,14 +141,17 @@ public:
     ProcessCollector(int topN = 10);
     ~ProcessCollector();
 
-    void collectProc();
+    // procs: 메인 루프가 이번 틱에 뜬 프로세스 목록 (takeProcessList). PID에 이름과 부모를 붙이는 데 쓴다.
+    // nullopt(목록을 못 받음)이면 이번 틱의 proc 목록을 만들지 않는다 — 빈 목록("프로세스 없음")으로 내보내지 않는다.
+    void collectProc(const std::optional<ProcessList>& procs);
 
 
     void setTopN(int n);
 
     ETWNetwork& getEtwNet() { return etwNet; }
 
-    SnapshotProcData makeSnapshot();
+    // nullopt = 이번 틱은 proc 목록을 만들지 못함 (보내지 않는다)
+    std::optional<SnapshotProcData> makeSnapshot();
 
     // ETWNetwork 프로세스 정리 주기용
     int cleanupTick = 0;
