@@ -8,11 +8,11 @@
 
 class DiskCollector {
 private:
-	PDH_HCOUNTER readCounter;
-	PDH_HCOUNTER writeCounter;
+	PDH_HCOUNTER readCounter = nullptr;
+	PDH_HCOUNTER writeCounter = nullptr;
 
 public:
 	void init(PDH_HQUERY& query);
-	double getReadKB() const;
-	double getWriteKB() const;
+	PdhUtil::Reading getReadKB() const;
+	PdhUtil::Reading getWriteKB() const;
 };

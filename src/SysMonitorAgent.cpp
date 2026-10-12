@@ -161,14 +161,25 @@ int main() {
     ProcessCollector procCollector;
     TargetCollector targetCollector(procCollector.getEtwNet());
 
+    // 프로세스 시작 이벤트는 ETW 세션이 열려야 온다 (관리자 권한 필요). 없어도 수집은 그대로 하고, 무엇이 달라지는지만 한 번 알린다.
+    if (!procCollector.getEtwNet().processEventsEnabled()) {
+        spdlog::warn("[SysMonitorAgent] process start events are unavailable (the Agent is not running as administrator, or the ETW session could not be opened). "
+            "Collection continues from the per-second process list: a process started by a launcher that exits within a second can be missing from a target's children. "
+            "Run the Agent as administrator to close that gap. (A parent PID reused within a second cannot be told apart either way)");
+    }
+
     // 여기는 메인 루프 스레드이므로 registerTarget()을 직접 불러도 된다 (다른 스레드는 requestRegister() 경유).
     for (const auto& name : *targetNames) {
         targetCollector.registerTarget(name);
     }
 
     int tick = 0;
+    bool processListWarned = false;   // 프로세스 목록 실패를 이미 알렸는가
     while (true) {
         const auto loopStart = std::chrono::steady_clock::now();
+        // 이번 틱의 시각 — sys / proc / target 스냅샷이 모두 이 값을 싣는다. 수집기마다 따로 정하면 한 틱의 스냅샷이
+        // 서로 다른 시각을 갖게 되어, 받는 쪽이 같은 틱끼리 묶거나 "어디까지 받았는가"를 시각 하나로 가를 수 없다.
+        const auto tickTime = std::chrono::system_clock::now();
 
         // 다른 스레드가 큐에 넣은 타겟 등록/해제 요청을 이 스레드에서 반영한다 (Phase 7 역방향 명령이 쓸 경로)
         targetCollector.applyPending();
@@ -178,12 +189,18 @@ int main() {
 
         // 프로세스 목록은 틱당 1번 떠서 proc 목록과 타겟 수집이 함께 쓴다 (같은 시점의 목록, 스냅샷 1번).
         // 못 받은 틱은 빈 목록으로 취급하지 않는다: proc 목록은 보내지 않고, 타겟은 직전 상태를 유지한다.
+        // 같은 실패가 매 틱 쌓이지 않게 실패가 시작될 때 1번만 알리고, 다시 받으면 그 사실도 1번 알린다.
         const std::optional<ProcessList> procs = takeProcessList();
-        if (!procs) {
-            spdlog::warn("[SysMonitorAgent] process snapshot failed (error {}) — proc list is not sent and target start/exit detection is skipped this tick", GetLastError());
+        if (!procs && !processListWarned) {
+            processListWarned = true;
+            spdlog::warn("[SysMonitorAgent] process snapshot failed (error {}) — proc list is not sent and target start/exit detection is skipped until it succeeds again", GetLastError());
+        }
+        else if (procs && processListWarned) {
+            processListWarned = false;
+            spdlog::info("[SysMonitorAgent] process snapshot succeeds again");
         }
         procCollector.collectProc(procs);
-        targetCollector.collect(procs);
+        targetCollector.collect(procs, tickTime);
         if (tick % Config::SLOW_COLLECT_INTERVAL == 0) {
             sysCollector.collectSlow();   // 2초 주기 (디스크)
         }
@@ -192,7 +209,7 @@ int main() {
         // 로컬 DB는 Phase 4-3에서 붙으므로, 그 전까지 종료된 타겟은 요약 없이 NEVER_SEEN으로 보고된다.
         targetCollector.clearPendingDeactivated();
 
-        if (!shouldContinue(client.sendRealtime(sysCollector.makeSnapshot(), procCollector.makeSnapshot(), targetCollector.getSnapshot()), "realtime")) {
+        if (!shouldContinue(client.sendRealtime(sysCollector.makeSnapshot(tickTime), procCollector.makeSnapshot(tickTime), targetCollector.getSnapshot()), "realtime")) {
             return 1;
         }
 
