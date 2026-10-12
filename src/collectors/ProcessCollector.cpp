@@ -1,24 +1,49 @@
 ﻿#include "collectors/ProcessCollector.h"
+#include "util/PdhUtil.h"
+#include "util/StrUtil.h"
 #include <spdlog/spdlog.h>
+#include <cmath>
 #pragma comment(lib, "pdh.lib")
 
-static const char* SYSTEM_NAMES[] = {
-	"_Total", "Idle", "System", "smss", "csrss", "[System Process]",
-	"wininit", "winlogon", "services", "lsass",
-	"fontdrvhost", "dwm", "Memory Compression", nullptr
-};
+namespace {
+	constexpr double BYTES_PER_MB = 1024.0 * 1024.0;
 
-bool ProcessCollector::isSystemProcess(const std::string& name) const {
-	for (int i = 0; SYSTEM_NAMES[i]; ++i)
-		if (name == SYSTEM_NAMES[i]) return true;
-	return false;
+	// 카운터 하나의 배열을 읽은 결과
+	struct ArrayRead {
+		std::vector<char> buffer;
+		DWORD count = 0;
+		bool ok = false;	// 읽었고, PID 배열과 같은 순서로 쓸 수 있다
+
+		const PDH_FMT_COUNTERVALUE_ITEM* items() const {
+			return reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM*>(buffer.data());
+		}
+		// i번째 항목의 값. 배열을 읽지 못했거나 그 항목이 유효하지 않으면(프로세스가 처음 보인 틱의 비율 값 등) 없다.
+		std::optional<double> valueAt(DWORD i) const {
+			if (!ok) return std::nullopt;
+			const PDH_FMT_COUNTERVALUE& v = items()[i].FmtValue;
+			if (v.CStatus != PDH_CSTATUS_VALID_DATA && v.CStatus != PDH_CSTATUS_NEW_DATA) return std::nullopt;
+			if (std::isnan(v.doubleValue) || std::isinf(v.doubleValue)) return std::nullopt;
+			return v.doubleValue;
+		}
+	};
+
+	std::optional<double> divided(std::optional<double> value, double divisor) {
+		if (!value) return std::nullopt;
+		return *value / divisor;
+	}
+
+	// 값이 있는 것만 더한다. 둘 다 없으면 합도 없다 — 없는 값을 0으로 쳐서 더하지 않는다.
+	std::optional<double> addPresent(std::optional<double> a, std::optional<double> b) {
+		if (!a) return b;
+		if (!b) return a;
+		return *a + *b;
+	}
 }
-
 
 ProcessCollector::ProcessCollector(int topN) : topN(topN) {
 	PDH_STATUS statusMiddle = PdhOpenQuery(NULL, 0, &queryMiddle);
 	if (statusMiddle != ERROR_SUCCESS) {
-		spdlog::error("ProcessCollector: PdhOpenQuery(middle) Error 0x{:X}", statusMiddle);
+		spdlog::error("ProcessCollector: PdhOpenQuery(middle) Error 0x{:X}", static_cast<unsigned>(statusMiddle));
 	}
 
 	cores = std::thread::hardware_concurrency();
@@ -40,90 +65,63 @@ ProcessCollector::~ProcessCollector() {
 }
 
 void ProcessCollector::initInfo(PDH_HQUERY& query) {
-	PDH_STATUS pidStatus = PdhAddEnglishCounter(	//PID
-		queryMiddle,
-		"\\Process(*)\\ID Process",
-		0,
-		&procIDMiddle
-	);
-	if (pidStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", pidStatus);
-	}
-
-	PDH_STATUS cpuStatus = PdhAddEnglishCounter(	//CPU 사용량(%)
-		queryMiddle,
-		"\\Process(*)\\% Processor Time",
-		0,
-		&procCpuUsage
-	);
-	if (cpuStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", cpuStatus);
-	}
-
-	PDH_STATUS memStatus = PdhAddEnglishCounter(	//실질적인 MEM
-		queryMiddle,
-		"\\Process(*)\\Working Set - Private",
-		0,
-		&procMem
-	);
-	if (memStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", memStatus);
-	}
-
-	PDH_STATUS priStatus = PdhAddEnglishCounter(	//Private MEM 메모리 누수 감지용
-		queryMiddle,
-		"\\Process(*)\\Private Bytes",
-		0,
-		&procPrivateMem
-	);
-	if (priStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", priStatus);
-	}
-
-
-	// ----------------------------------------
-	PDH_STATUS readStatus = PdhAddEnglishCounter(queryMiddle,
-		"\\Process(*)\\IO Read Bytes/sec", 0, &procDiskR);
-	if (readStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", readStatus);
-	}
-
-	PDH_STATUS writeStatus = PdhAddEnglishCounter(queryMiddle,
-		"\\Process(*)\\IO Write Bytes/sec", 0, &procDiskW);
-	if (writeStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", writeStatus);
-	}
-	// ----------------------------------------
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\ID Process", procIDMiddle, "ProcessCollector");	//PID
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\% Processor Time", procCpuUsage, "ProcessCollector");	//CPU 사용량(%)
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\Working Set - Private", procMem, "ProcessCollector");	//실질적인 MEM
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\Private Bytes", procPrivateMem, "ProcessCollector");	//Private MEM 메모리 누수 감지용
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\IO Read Bytes/sec", procDiskR, "ProcessCollector");
+	PdhUtil::addCounter(queryMiddle, L"\\Process(*)\\IO Write Bytes/sec", procDiskW, "ProcessCollector");
 }
 
-std::vector<char> ProcessCollector::getCountArray(PDH_HCOUNTER hCounter, DWORD& count) {
-	DWORD bufferSize = 0;
-	PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE, &bufferSize, &count, NULL);
+PDH_STATUS ProcessCollector::getCountArray(PDH_HCOUNTER hCounter, std::vector<char>& buffer, DWORD& count) {
+	// PDH_FMT_NOCAP100: 프로세스의 "% Processor Time"은 코어 하나를 다 쓰면 100, 둘이면 200이다.
+	// 이 플래그가 없으면 PDH가 100에서 잘라, 여러 코어를 쓰는 프로세스가 (100 / 코어 수)%로 낮게 보고된다.
+	// 백분율이 아닌 카운터(바이트, PID 등)에는 영향이 없다.
+	constexpr DWORD format = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
 
-	std::vector<char> buffer;
-	if (count == 0 || bufferSize == 0) return buffer;
+	buffer.clear();
+	count = 0;
+
+	// 크기를 먼저 묻는다 — 정상이면 PDH_MORE_DATA와 함께 필요한 크기가 온다
+	DWORD bufferSize = 0;
+	PDH_STATUS status = PdhGetFormattedCounterArray(hCounter, format, &bufferSize, &count, NULL);
+	if (status != PDH_MORE_DATA || count == 0 || bufferSize == 0) {
+		count = 0;
+		return (status == PDH_MORE_DATA || status == ERROR_SUCCESS) ? static_cast<PDH_STATUS>(PDH_NO_DATA) : status;
+	}
 
 	buffer.resize(bufferSize);
-	PDH_STATUS status = PdhGetFormattedCounterArray(
+	status = PdhGetFormattedCounterArray(
 		hCounter,
-		PDH_FMT_DOUBLE,
+		format,
 		&bufferSize,
 		&count,
 		reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(buffer.data()));
 
 	if (status != ERROR_SUCCESS) {
-		spdlog::warn("getCountArray Error 0x{:X}", status);
 		count = 0;
 		buffer.clear();
 	}
 
-	return buffer;
+	return status;
 }
 
 // ---------------------------------------------------------------------------
 // 1초 주기 수집
 // ---------------------------------------------------------------------------
-void ProcessCollector::collectProc() {
+void ProcessCollector::collectProc(const std::optional<ProcessList>& procs) {
+	procList.clear();
+	aggregatedProcList.clear();
+	// 목록이 없어도 수집은 한다 — 비율 값의 기준점이 끊기지 않게
+	const PDH_STATUS collectStatus = PdhCollectQueryData(queryMiddle);
+	PdhUtil::reportReadState(collectWarned, collectStatus == ERROR_SUCCESS, "ProcessCollector", "PdhCollectQueryData (every process metric)", collectStatus);
+
+	// 프로세스 목록을 못 받은 틱: PID에 이름을 붙일 수 없으므로 이번 틱의 proc 목록은 만들지 않는다.
+	// 빈 목록으로 내보내면 받는 쪽이 "프로세스가 하나도 없다"로 읽는다.
+	// lastTime을 그대로 두어, 그동안 쌓인 ETW 네트워크 바이트가 다음 틱에 실제 경과 시간으로 나뉘게 한다.
+	snapshotAvailable = procs.has_value();
+	if (!procs) return;
+
 	auto now = std::chrono::steady_clock::now();
 	double elapsedSec = std::chrono::duration <double>(now - lastTime).count();
 	lastTime = now;
@@ -131,78 +129,80 @@ void ProcessCollector::collectProc() {
 		elapsedSec = 1.0;
 	}
 
+	// 1단계 - 카운터별 배열 읽기
+	// 배열을 읽지 못했다고 목록을 비우지 않는다: 읽지 못한 지표만 비워 둔다. 빈 목록으로 내보내면 받는 쪽이
+	// "프로세스가 하나도 없다"로 읽고, 0으로 채우면 실제 0과 구분할 수 없다.
+	// 값은 "없음"으로 나가므로 원인은 여기서 한 번 알린다 (실패가 시작될 때 1번, 다시 읽히면 1번).
+	enum : size_t { PID, CPU, MEM, PRIVATE_MEM, DISK_READ, DISK_WRITE };
+	struct { PDH_HCOUNTER handle; const char* name; } const counters[ARRAY_COUNT] = {
+		{ procIDMiddle,   "ID Process" },
+		{ procCpuUsage,   "% Processor Time" },
+		{ procMem,        "Working Set - Private" },
+		{ procPrivateMem, "Private Bytes" },
+		{ procDiskR,      "IO Read Bytes/sec" },
+		{ procDiskW,      "IO Write Bytes/sec" },
+	};
 
-	procList.clear();
-	aggregatedProcList.clear();
-	PdhCollectQueryData(queryMiddle);
+	ArrayRead arrays[ARRAY_COUNT];
+	const bool collected = (collectStatus == ERROR_SUCCESS);
+	// 수집이 실패한 틱에는 배열을 읽지 않는다 — 이전 수집의 값이 그대로 돌아올 수 있다 (수집 실패는 위에서 알렸다)
+	if (collected) {
+		for (size_t c = 0; c < ARRAY_COUNT; ++c) {
+			PDH_STATUS status = getCountArray(counters[c].handle, arrays[c].buffer, arrays[c].count);
+			arrays[c].ok = (status == ERROR_SUCCESS);
 
-	// 1단계 - PID 배열 수집
-	DWORD pidItemCount = 0;
-	std::vector<char> pidbuffer = getCountArray(procIDMiddle, pidItemCount);
-	auto* pidItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(pidbuffer.data());
-
-	auto tree = buildProcTree();
-	// 2단계 - ToolHelp32로 PID -> 이름 맵 구성
-	std::unordered_map<DWORD, std::string> pidToName;
-	for (const auto& [pid, entry] : tree) {
-		pidToName[pid] = entry.name;
+			// 다른 배열은 PID 배열과 같은 순서라는 전제로 같은 인덱스를 쓴다 (한 번의 수집에서 나온 배열들).
+			// 개수가 다르면 그 전제가 깨진 것이므로 그 지표는 읽지 못한 것으로 본다 — 어긋난 인덱스로 남의 값을 붙이지 않는다.
+			if (c != PID && arrays[c].ok && arrays[PID].ok && arrays[c].count != arrays[PID].count) {
+				arrays[c].ok = false;
+				status = PDH_INVALID_DATA;
+			}
+			PdhUtil::reportReadState(arrayWarned[c], arrays[c].ok, "ProcessCollector", counters[c].name, status);
+		}
 	}
 
-	// 3단계 - PID 배열 순회하며 이름으로 나머지 카운터 매핑
-	// 같은 query에서 수집 -> 인덱스 일치 보장
-	// PID로 이름 검증 -> 이름 중복 문제 없음
-	DWORD cpuItemCount = 0;
-	DWORD memItemCount = 0, priMemItemCount = 0;
-	DWORD diskRCounter = 0, diskWCounter = 0;
+	auto tree = buildProcTree(*procs);
 
+	// 2단계 - 목록 구성
+	// 이름으로 걸러 내지 않는다 — proc은 전체 목록이고 무엇을 숨길지는 UI가 정한다.
+	// 빼는 것은 PID 0뿐이다: PDH의 합계 항목(_Total)과 Idle이 PID 0이고, 프로세스가 아니라 의사 항목이다.
+	if (arrays[PID].ok) {
+		// PID 배열을 따라가며 같은 인덱스의 값을 붙인다. 이름은 프로세스 목록에서 PID로 찾는다 (PDH의 이름은 중복될 수 있다).
+		const PDH_FMT_COUNTERVALUE_ITEM* pidItems = arrays[PID].items();
+		for (DWORD i = 0; i < arrays[PID].count; ++i) {
+			if (pidItems[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA && pidItems[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA) continue;
 
-	std::vector<char> cpubuffer = getCountArray(procCpuUsage, cpuItemCount);
-	std::vector<char> membuffer = getCountArray(procMem, memItemCount);
-	std::vector<char> primembuffer = getCountArray(procPrivateMem, priMemItemCount);
-	std::vector<char> diskRbuffer = getCountArray(procDiskR, diskRCounter);
-	std::vector<char> diskWbuffer = getCountArray(procDiskW, diskWCounter);
+			const DWORD pid = static_cast<DWORD>(pidItems[i].FmtValue.doubleValue);
+			if (pid == 0) continue;
 
+			auto entryIt = tree.find(pid);
+			if (entryIt == tree.end()) continue;
 
-	auto* cpuItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(cpubuffer.data());
-	auto* memItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(membuffer.data());
-	auto* privateMemItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(primembuffer.data());
-	auto* diskRItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(diskRbuffer.data());
-	auto* diskWItems = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM*>(diskWbuffer.data());
+			auto proc_ = std::make_unique<ProcList>();
 
-	// 가장 작은 개수로 범위 제한
-	DWORD safeCount = (std::min)({
-		pidItemCount, cpuItemCount, memItemCount,
-		priMemItemCount, diskRCounter, diskWCounter });
+			proc_->setProcID(pid);
+			proc_->setProcName(entryIt->second.name);
 
+			proc_->setProcCpuUsage(divided(arrays[CPU].valueAt(i), cores));
+			proc_->setProcMemoryMB(divided(arrays[MEM].valueAt(i), BYTES_PER_MB));
+			proc_->setProcPrivateMemoryMB(divided(arrays[PRIVATE_MEM].valueAt(i), BYTES_PER_MB));
+			proc_->setDiskReadMBs(divided(arrays[DISK_READ].valueAt(i), BYTES_PER_MB));
+			proc_->setDiskWriteMBs(divided(arrays[DISK_WRITE].valueAt(i), BYTES_PER_MB));
 
-	for (DWORD i = 0; i < safeCount; ++i) {
-		DWORD pid = static_cast<DWORD>(pidItems[i].FmtValue.doubleValue);
+			aggregatedProcList.push_back(std::move(proc_));
+		}
+	}
+	else {
+		// PID 배열을 읽지 못했다 — 다른 배열의 값이 어느 프로세스의 것인지 알 수 없다.
+		// 목록은 프로세스 목록으로 만들고(PID와 이름), PDH 지표는 모두 비워 둔다.
+		for (const auto& p : *procs) {
+			if (p.pid == 0) continue;
 
-		// ToolHelp32로 얻은 이름으로 검증
-		auto nameIt = pidToName.find(pid);
-		if (nameIt == pidToName.end()) continue;
-
-		std::string name = nameIt->second;
-
-		//if (name == "_Total" || name == "Idle") continue;
-		if (isSystemProcess(name)) continue;
-
-		if (pidItems[i].FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-			pidItems[i].FmtValue.CStatus != PDH_CSTATUS_NEW_DATA)
-			continue;
-
-		auto proc_ = std::make_unique<ProcList>();
-
-		proc_->setProcID(pid);
-		proc_->setProcName(name);
-
-		proc_->setProcCpuUsage(cpuItems[i].FmtValue.doubleValue / cores);
-		proc_->setProcMemoryMB(memItems[i].FmtValue.doubleValue / (1024.0 * 1024.0));
-		proc_->setProcPrivateMemoryMB(privateMemItems[i].FmtValue.doubleValue / (1024.0 * 1024.0));
-		proc_->setDiskReadMBs(diskRItems[i].FmtValue.doubleValue / (1024.0 * 1024.0));
-		proc_->setDiskWriteMBs(diskWItems[i].FmtValue.doubleValue / (1024.0 * 1024.0));
-
-		aggregatedProcList.push_back(std::move(proc_));
+			auto proc_ = std::make_unique<ProcList>();
+			proc_->setProcID(p.pid);
+			proc_->setProcName(tree[p.pid].name);
+			aggregatedProcList.push_back(std::move(proc_));
+		}
 	}
 
 	std::unordered_set<DWORD> alivePids;
@@ -267,11 +267,11 @@ void ProcessCollector::aggregateToParents(std::unordered_map<DWORD, ProcEntry>& 
 			if (childEntry.ppid == pid) // pid의 자식들
 				dfs(childPid);
 		}
-		parent->setProcCpuUsage(parent->getProcCpuUsage() + child->getProcCpuUsage());
-		parent->setProcMemoryMB(parent->getProcMemoryMB() + child->getProcMemoryMB());
-		parent->setProcPrivateMemoryMB(parent->getProcPrivateMemMB() + child->getProcPrivateMemMB());
-		parent->setDiskReadMBs(parent->getDiskReadMBs() + child->getDiskReadMBs());
-		parent->setDiskWriteMBs(parent->getDiskWriteMBs() + child->getDiskWriteMBs());
+		parent->setProcCpuUsage(addPresent(parent->getProcCpuUsage(), child->getProcCpuUsage()));
+		parent->setProcMemoryMB(addPresent(parent->getProcMemoryMB(), child->getProcMemoryMB()));
+		parent->setProcPrivateMemoryMB(addPresent(parent->getProcPrivateMemMB(), child->getProcPrivateMemMB()));
+		parent->setDiskReadMBs(addPresent(parent->getDiskReadMBs(), child->getDiskReadMBs()));
+		parent->setDiskWriteMBs(addPresent(parent->getDiskWriteMBs(), child->getDiskWriteMBs()));
 		parent->setNetRecvMbps(parent->getNetRecvMbps() + child->getNetRecvMbps());
 		parent->setNetSentMbps(parent->getNetSentMbps() + child->getNetSentMbps());
 
@@ -290,25 +290,16 @@ void ProcessCollector::aggregateToParents(std::unordered_map<DWORD, ProcEntry>& 
 		aggregatedProcList.end());
 }
 
-std::unordered_map<DWORD, ProcEntry> ProcessCollector::buildProcTree() {
+std::unordered_map<DWORD, ProcEntry> ProcessCollector::buildProcTree(const ProcessList& procs) {
 	std::unordered_map<DWORD, ProcEntry> tree;
-
-	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snap == INVALID_HANDLE_VALUE) return tree;
-
-	PROCESSENTRY32 entry = {};
-	entry.dwSize = sizeof(entry);
-
-	if (Process32First(snap, &entry)) {
-		do {
-			ProcEntry pe;
-			pe.pid = entry.th32ProcessID;
-			pe.ppid = entry.th32ParentProcessID;
-			pe.name = entry.szExeFile;
-			tree[pe.pid] = pe;
-		} while (Process32Next(snap, &entry));
+	tree.reserve(procs.size());
+	for (const auto& p : procs) {
+		ProcEntry pe;
+		pe.pid = p.pid;
+		pe.ppid = p.ppid;
+		pe.name = StrUtil::wideToUtf8(p.exeName);	// 목록의 이름은 이미 ".exe"를 뗀 것 — 타겟 이름과 같은 표기
+		tree[pe.pid] = pe;
 	}
-	CloseHandle(snap);
 	return tree;
 }
 
@@ -317,11 +308,13 @@ void ProcessCollector::setTopN(int n) {
 	topN = n;
 }
 
-SnapshotProcData ProcessCollector::makeSnapshot() {
+std::optional<SnapshotProcData> ProcessCollector::makeSnapshot(std::chrono::system_clock::time_point tickTime) {
+	if (!snapshotAvailable) return std::nullopt;
+
 	size_t count = aggregatedProcList.size();
 
 	SnapshotProcData snapshot;
-	snapshot.timestamp = std::chrono::system_clock::now();
+	snapshot.timestamp = tickTime;
 	snapshot.topN = topN;
 
 	for (size_t i = 0; i < count; ++i) {

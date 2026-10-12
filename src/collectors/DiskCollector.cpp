@@ -1,32 +1,14 @@
 #include "collectors/DiskCollector.h"
 
 void DiskCollector::init(PDH_HQUERY& query) {
-	PDH_STATUS readStatus = PdhAddEnglishCounterW(
-		query,
-		L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec",
-		0,
-		&readCounter
-	);
-	if (readStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", readStatus);
-	}
-
-
-	PDH_STATUS writeStatus = PdhAddEnglishCounterW(
-		query,
-		L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec",
-		0,
-		&writeCounter
-	);
-	if (writeStatus != ERROR_SUCCESS) {
-		spdlog::error("Counter Error 0x{:X}", writeStatus);
-	}
+	PdhUtil::addCounter(query, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", readCounter, "DiskCollector");
+	PdhUtil::addCounter(query, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", writeCounter, "DiskCollector");
 }
 
-double DiskCollector::getReadKB() const {
-	return PdhUtil::getDouble(readCounter) / 1024.0;
+PdhUtil::Reading DiskCollector::getReadKB() const {
+	return PdhUtil::scaled(PdhUtil::read(readCounter), 1.0 / 1024.0);
 }
 
-double DiskCollector::getWriteKB() const {
-	return PdhUtil::getDouble(writeCounter) / 1024.0;
+PdhUtil::Reading DiskCollector::getWriteKB() const {
+	return PdhUtil::scaled(PdhUtil::read(writeCounter), 1.0 / 1024.0);
 }

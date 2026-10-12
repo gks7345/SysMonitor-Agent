@@ -1,4 +1,5 @@
 ﻿#include "collectors/ETWNetwork.h"
+#include "util/StrUtil.h"
 #include <spdlog/spdlog.h>
 
 ETWNetwork* ETWNetwork::instance = nullptr;
@@ -32,7 +33,7 @@ GUID ETWNetwork::findProviderGuid(const std::wstring& providerName) {
 
         if (providerName == name) {
             spdlog::info("ETWNetwork: Provider '{}' GUID Search Success",
-                std::string(providerName.begin(), providerName.end()));
+                StrUtil::wideToUtf8(providerName));
             return entry.ProviderGuid;
         }
     }
@@ -46,7 +47,7 @@ std::unordered_set<ULONG> ETWNetwork::getLoopbackAddresses() {
     std::unordered_set<ULONG> result;
 
     // 항상 127.0.0.1 포함
-    result.insert(inet_addr("127.0.0.1"));
+    result.insert(htonl(INADDR_LOOPBACK));
 
     ULONG bufSize = 0;
     GetAdaptersAddresses(AF_INET,
@@ -174,6 +175,12 @@ bool ETWNetwork::start() {
         return false;
     }
 
+    // 프로세스 시작/종료 이벤트의 공급자 — 못 찾아도 네트워크 수집은 한다 (startSession이 건너뛴다)
+    KERNEL_PROCESS_GUID = findProviderGuid(L"Microsoft-Windows-Kernel-Process");
+    if (KERNEL_PROCESS_GUID == GUID{}) {
+        spdlog::warn("ETWNetwork: Kernel-Process Provider Not Found — process start/stop events are unavailable");
+    }
+
     // 루프백 주소 자동 수집
     loopbackAddrs = getLoopbackAddresses();
     spdlog::info("ETWNetwork: {} loopbackAddrs Detect", loopbackAddrs.size());
@@ -189,6 +196,7 @@ bool ETWNetwork::start() {
 void ETWNetwork::stop() {
     if (!running.load()) return;
     running.store(false);
+    procEventsOn.store(false);
 
     if (traceHandle != INVALID_PROCESSTRACE_HANDLE) {
         CloseTrace(traceHandle);
@@ -242,6 +250,23 @@ bool ETWNetwork::startSession() {
         spdlog::error("ETWNetwork: EnableTraceEx2 Error 0x{:X}", status);
         return false;
     }
+
+    // 프로세스 시작/종료 이벤트 — 같은 세션에 공급자를 하나 더 켠다. 실패해도 네트워크 수집은 계속한다.
+    if (!(KERNEL_PROCESS_GUID == GUID{})) {
+        status = EnableTraceEx2(
+            sessionHandle, &KERNEL_PROCESS_GUID,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            TRACE_LEVEL_INFORMATION,
+            KERNEL_PROCESS_KEYWORD_PROCESS, 0, 0, &params);
+
+        if (status == ERROR_SUCCESS) {
+            // 세션을 성공적으로 열었다 - true
+            procEventsOn.store(true);
+        }
+        else {
+            spdlog::warn("ETWNetwork: EnableTraceEx2 (Kernel-Process) Error 0x{:X} — process start/stop events are unavailable", status);
+        }
+    }
     return true;
 }
 
@@ -255,6 +280,7 @@ void ETWNetwork::processLoop() {
     if (traceHandle == INVALID_PROCESSTRACE_HANDLE) {
         spdlog::error("ETWNetwork: OpenTrace Error 0x{:X}", GetLastError());
         running.store(false);
+        procEventsOn.store(false);
         return;
     }
 
@@ -270,6 +296,11 @@ void ETWNetwork::processLoop() {
 VOID WINAPI ETWNetwork::onEvent(PEVENT_RECORD pEvent) {
     if (!instance || !instance->running.load()) return;
     if (!pEvent) return;
+
+    if (instance->procEventsOn.load() && IsEqualGUID(pEvent->EventHeader.ProviderId, instance->KERNEL_PROCESS_GUID)) {
+        instance->onProcessEvent(pEvent);
+        return;
+    }
 
     if (!IsEqualGUID(pEvent->EventHeader.ProviderId, instance->KERNEL_NETWORK_GUID)) return;
 
@@ -297,8 +328,8 @@ VOID WINAPI ETWNetwork::onEvent(PEVENT_RECORD pEvent) {
     if (bytes == 0) return;
 
     // 로컬호스트 트래픽 제외 (daddr 필드가 있을때만)
-    // daddr가 존재하면(daddrOffset != ULONG_MAX) minLength 계산에 이미 daddrOffset + sizeof(ULONG)이
-    // 반영되어 있으므로(buildLayout, 120-123줄), 위쪽의 UserDataLength < minLength 검사(288줄)만으로
+    // daddr가 존재하면(daddrOffset != ULONG_MAX) buildLayout()이 minLength를 계산할 때 daddrOffset + sizeof(ULONG)까지
+    // 반영하므로, 위의 UserDataLength < layout->minLength 검사만으로
     // 경계가 이미 보장된다 — 여기서 길이를 다시 재는 것은 중복이라 존재 여부만 확인한다.
     if (layout->daddrOffset != ULONG_MAX) {
         ULONG daddr = *reinterpret_cast<const ULONG*>(data + layout->daddrOffset);
@@ -317,6 +348,111 @@ VOID WINAPI ETWNetwork::onEvent(PEVENT_RECORD pEvent) {
         entry->targetRecvBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
 
+}
+
+// -------------------------------------------------------
+// 프로세스 시작/종료 이벤트
+// -------------------------------------------------------
+ProcEventLayout ETWNetwork::buildProcLayout(PEVENT_RECORD pEvent) {
+    ProcEventLayout layout;
+    const USHORT id = pEvent->EventHeader.EventDescriptor.Id;
+
+    ULONG bufSize = 0;
+    ULONG status = TdhGetEventInformation(pEvent, 0, nullptr, nullptr, &bufSize);
+    if (status != ERROR_INSUFFICIENT_BUFFER || bufSize == 0) return layout;
+
+    std::vector<BYTE> buf(bufSize);
+    auto* pInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buf.data());
+    status = TdhGetEventInformation(pEvent, 0, nullptr, pInfo, &bufSize);
+    if (status != ERROR_SUCCESS) return layout;
+
+    // 앞에서부터 필드 크기를 더해 오프셋을 구한다. 크기가 고정되지 않은 필드(문자열, SID 등)를 만나면
+    // 그 뒤의 오프셋은 이 방법으로 알 수 없으므로 멈춘다 — 찾는 두 필드는 그 앞에 있다.
+    ULONG offset = 0;
+    for (ULONG i = 0; i < pInfo->TopLevelPropertyCount; ++i) {
+        const auto& prop = pInfo->EventPropertyInfoArray[i];
+        // 크기를 미리 알 수 없는 필드를 만나면 멈춘다.
+        if ((prop.Flags & (PropertyStruct | PropertyParamLength | PropertyParamCount)) || prop.length == 0) break;
+
+        // 필드 이름은 prop에 들어있지 않는다 — NameOffset은 버퍼 시작에서 그 문자열까지의 거리
+        const wchar_t* fieldName = reinterpret_cast<const wchar_t*>(buf.data() + prop.NameOffset);
+        const ULONG fieldSize = prop.length;
+
+        if (_wcsicmp(fieldName, L"ProcessID") == 0 && fieldSize == sizeof(ULONG)) {
+            layout.pidOffset = offset;
+            layout.minLength = (std::max)(layout.minLength, offset + fieldSize);
+        }
+        else if (_wcsicmp(fieldName, L"ParentProcessID") == 0 && fieldSize == sizeof(ULONG)) {
+            layout.parentOffset = offset;
+            layout.minLength = (std::max)(layout.minLength, offset + fieldSize);
+        }
+        offset += fieldSize;
+    }
+
+    // 시작 이벤트는 부모 PID까지 있어야 쓸 수 있다
+    layout.valid = layout.pidOffset != ULONG_MAX && (id != PROCESS_START_EVENT_ID || layout.parentOffset != ULONG_MAX);
+
+    spdlog::info("ETWNetwork: process event layout id={} version={} valid={} pid@{} parent@{}",
+        id, pEvent->EventHeader.EventDescriptor.Version, layout.valid,
+        layout.pidOffset == ULONG_MAX ? -1 : (int)layout.pidOffset,
+        layout.parentOffset == ULONG_MAX ? -1 : (int)layout.parentOffset);
+    return layout;
+}
+
+const ProcEventLayout* ETWNetwork::getOrBuildProcLayout(PEVENT_RECORD pEvent) {
+    // Id는 16비트(USHORT), Version은 8비트(UCHAR)
+    // ID를 왼쪽으로 8비트 밀어 아래 8비트를 비우고, 그 자리에 버전을 OR로 채운다.
+    // 버전을 키에 넣는 이유: 같은 ID라도 버전이 다르면 필드 구성이 달라 오프셋이 다르다.
+    const ULONG key = (static_cast<ULONG>(pEvent->EventHeader.EventDescriptor.Id) << 8) | pEvent->EventHeader.EventDescriptor.Version;
+
+    {
+        std::lock_guard<std::mutex> lock(layoutMtx);
+        auto it = procLayoutCache.find(key);
+        if (it != procLayoutCache.end()) return &it->second;
+    }
+
+    ProcEventLayout layout = buildProcLayout(pEvent);
+
+    std::lock_guard<std::mutex> lock(layoutMtx);
+    procLayoutCache[key] = layout;
+    return &procLayoutCache[key];
+}
+
+void ETWNetwork::onProcessEvent(PEVENT_RECORD pEvent) {
+    const USHORT id = pEvent->EventHeader.EventDescriptor.Id;
+    if (id != PROCESS_START_EVENT_ID && id != PROCESS_STOP_EVENT_ID) return;
+    if (!pEvent->UserData) return;
+
+    const ProcEventLayout* layout = getOrBuildProcLayout(pEvent);
+    if (!layout) return;
+    if (!layout->valid) {
+        // 필드를 찾지 못했다 — 시작 이벤트를 읽지 못하면 누가 만든 프로세스인지 알 수 없고, 종료 이벤트를 읽지 못하면
+        // 끝난 PID를 제때 지울 수 없다. 어느 쪽이든 이벤트를 순서대로 따라갈 수 없으므로 통째로 끈다.
+        // 호출자는 프로세스 목록만으로 계속 동작한다.
+        if (procEventsOn.exchange(false)) {
+            spdlog::warn("ETWNetwork: process event id={} version={} has no usable ProcessID/ParentProcessID field — process start/stop events are turned off", id, pEvent->EventHeader.EventDescriptor.Version);
+        }
+        return;
+    }
+    if (pEvent->UserDataLength < layout->minLength) return;
+
+    const BYTE* data = reinterpret_cast<const BYTE*>(pEvent->UserData);
+
+    ProcessEvent ev;
+    ev.isStart = (id == PROCESS_START_EVENT_ID);
+    ev.pid = *reinterpret_cast<const ULONG*>(data + layout->pidOffset);
+    if (ev.isStart) ev.parentPid = *reinterpret_cast<const ULONG*>(data + layout->parentOffset);
+
+    std::lock_guard<std::mutex> lock(procEventMtx);
+    if (procEvents.size() >= MAX_PENDING_PROCESS_EVENTS) procEvents.clear();
+    procEvents.push_back(ev);
+}
+
+std::vector<ProcessEvent> ETWNetwork::takeProcessEvents() {
+    std::vector<ProcessEvent> out;
+    std::lock_guard<std::mutex> lock(procEventMtx);
+    out.swap(procEvents);
+    return out;
 }
 
 std::shared_ptr<NetAccumEntry> ETWNetwork::getOrCreateEntry(DWORD pid) {

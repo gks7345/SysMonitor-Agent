@@ -10,12 +10,12 @@ add_library (SysMonitorAgentCore STATIC
 	"collectors/SystemCollector.cpp" "collectors/CpuCollector.cpp" "collectors/MemCollector.cpp" "collectors/NetCollector.cpp" "collectors/DiskCollector.cpp"
 	"collectors/ProcessCollector.cpp" "collectors/ETWNetwork.cpp" "collectors/TargetCollector.cpp"
 	"datastore/DataStore.cpp" "datastore/SummaryStore.cpp"
-	"analysis/SessionReport.cpp")
+	"analysis/SessionReport.cpp"
+	"util/StrUtil.cpp" "util/ProcessList.cpp")
 target_include_directories(SysMonitorAgentCore PUBLIC "../include")
 
 target_compile_definitions(SysMonitorAgentCore PRIVATE
-    _WINSOCKAPI_        # winsock.h 자동 include 차단
-    WIN32_LEAN_AND_MEAN # windows.h 경량화
+    WIN32_LEAN_AND_MEAN # windows.h 경량화 — winsock.h를 끌어오지 않아 winsock2.h와 충돌하지 않는다
 )
 
 
@@ -67,7 +67,7 @@ add_library(inih STATIC "${inih_SOURCE_DIR}/ini.c" "${inih_SOURCE_DIR}/cpp/INIRe
 target_include_directories(inih PUBLIC "${inih_SOURCE_DIR}" "${inih_SOURCE_DIR}/cpp")
 
 # main / gRPC 클라이언트 진입점
-add_executable(SysMonitorAgent "grpc/GrpcClient.cpp" "SysMonitorAgent.cpp" "AgentConfig.cpp")
+add_executable(SysMonitorAgent "grpc/GrpcClient.cpp" "grpc/SnapshotConverter.cpp" "SysMonitorAgent.cpp" "AgentConfig.cpp")
 target_link_libraries(SysMonitorAgent PRIVATE SysMonitorAgentCore SysMonitorProto inih)
 
 if(MSVC)
@@ -76,4 +76,9 @@ if(MSVC)
     target_compile_options(SysMonitorProto PRIVATE /utf-8)
     target_compile_options(SysMonitorAgent PRIVATE /utf-8)
     target_compile_options(inih PRIVATE /utf-8)
+    # C4062(enum switch에서 처리 안 된 열거자, default 없을 때)는 /W4에서도 꺼져 있어 직접 켜고, 오류로 다룬다 —
+    # TargetStatus·ClientResult 같은 enum에 값이 추가되면 default 없는 switch를 고치기 전에는 빌드되지 않도록.
+    # 경고로만 두면 빌드가 성공해서, 출력을 보지 않으면 빠뜨린 switch를 놓친다.
+    target_compile_options(SysMonitorAgentCore PRIVATE /we4062)
+    target_compile_options(SysMonitorAgent PRIVATE /we4062)
 endif()

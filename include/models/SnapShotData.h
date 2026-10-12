@@ -3,39 +3,42 @@
 #include <vector>
 #include <chrono>
 #include <cstdint> 
+#include <optional>
 
 // ---------------------------------------------------------------------------
 // 시스템
 // ---------------------------------------------------------------------------
+// std::optional 필드: 값이 없으면 "읽지 못함"이다 — 그 카운터가 없는 Windows이거나 그 틱의 수집이 실패했을 때.
+// 0은 실제로 0일 때만 넣는다 (proto SysSnapshot의 optional 필드와 1:1).
 struct SnapshotSysCpu {
-	double cpuTotal = 0.0;
-	double cpuFreqGHz = 0.0;
+	std::optional<double> cpuTotal;
+	std::optional<double> cpuFreqGHz;
 
-	double cpuUser = 0.0;
-	double cpuKernel = 0.0;
-	double cpuQueueLength = 0.0;
+	std::optional<double> cpuUser;
+	std::optional<double> cpuKernel;
+	std::optional<double> cpuQueueLength;
 };
 
 struct SnapshotSysMem {
-	double memTotalMB = 0.0;
-	double memUsagePercent = 0.0;
-	double memUsedMB = 0.0;
-	double memAvailMB = 0.0;
+	std::optional<double> memTotalMB;
+	std::optional<double> memUsagePercent;	// memTotalMB와 memAvailMB로 계산 — 둘 중 하나가 없으면 없다
+	std::optional<double> memUsedMB;		// 위와 같음
+	std::optional<double> memAvailMB;
 
-	double commitMemPercent = 0.0;
-	double committedMemGB = 0.0;
-	double commitLimitGB = 0.0;
+	std::optional<double> commitMemPercent;
+	std::optional<double> committedMemGB;
+	std::optional<double> commitLimitGB;
 };
 
 struct SnapshotSysDisk {
 	std::chrono::system_clock::time_point lastTime = std::chrono::system_clock::now();
-	double diskReadKBs = 0.0;
-	double diskWriteKBs = 0.0;
+	std::optional<double> diskReadKBs;
+	std::optional<double> diskWriteKBs;
 };
 
 struct SnapshotSysNet {
-	double netSentKbps = 0.0;
-	double netRecvKbps = 0.0;
+	std::optional<double> netSentKbps;
+	std::optional<double> netRecvKbps;
 };
 
 struct SnapshotSysData {
@@ -50,17 +53,19 @@ struct SnapshotSysData {
 // ---------------------------------------------------------------------------
 // 프로세스
 // ---------------------------------------------------------------------------
+// std::optional 필드(PDH에서 오는 지표): 값이 없으면 "읽지 못함"이다 — 그 카운터의 배열을 읽지 못한 틱,
+// 프로세스가 처음 보인 틱의 비율 값(CPU·디스크). 0은 실제로 0일 때만 넣는다 (proto ProcInfo의 optional 필드와 1:1).
 struct SnapshotProc {
 	uint32_t	procID = 0;
 	std::string procName;
 
-	double		procCpuUsage = 0.0;
+	std::optional<double>	procCpuUsage;
 
-	double		procMemoryMB = 0.0;
-	double		procPrivateMemoryMB = 0.0;
+	std::optional<double>	procMemoryMB;
+	std::optional<double>	procPrivateMemoryMB;
 
-	double		procDiskReadMBs = 0.0;
-	double		procDiskWriteMBs = 0.0;
+	std::optional<double>	procDiskReadMBs;
+	std::optional<double>	procDiskWriteMBs;
 
 	double		procNetSentMbps = 0.0;
 	double		procNetRecvMbps = 0.0;
@@ -82,36 +87,47 @@ struct TargetNetConnection {
 	std::string state;		 // ESTABLISHED, LISTEN 등
 };
 
+// std::optional 필드 (SnapshotChildProcess / SnapshotTarget 공통): 값이 없으면 "수집하지 못함"이다 —
+// 그 프로세스를 열 권한이 없을 때, 비율 값(CPU·디스크·페이지 폴트)을 아직 계산할 수 없는 첫 틱,
+// 그 틱에 PDH가 값을 주지 않았을 때. 0은 실제로 0일 때만 넣는다 (proto의 optional 필드와 1:1, Phase 3 리뷰 High #5).
 struct SnapshotChildProcess {
 	uint32_t pid = 0;
 	std::string processName;
 
 	// 기본 지표
-	double cpuUsage = 0.0;
-	double memoryMB = 0.0;
-	double privateMemoryMB = 0.0;
-	double virtualMemoryMB = 0.0;
-	double diskReadMBs = 0.0;
-	double diskWriteMBs = 0.0;
+	std::optional<double> cpuUsage;
+	std::optional<double> memoryMB;		// Working Set - Private
+	std::optional<double> privateMemoryMB;
+	std::optional<double> virtualMemoryMB;
+	std::optional<double> diskReadMBs;
+	std::optional<double> diskWriteMBs;
 	double netSentMbps = 0.0;
 	double netRecvMbps = 0.0;
 
 	// 리소스
-	uint32_t threadCount = 0;
-	uint32_t handleCount = 0;
-	uint32_t gdiObjectCount = 0;
-	double   pageFaultRate = 0.0;
+	std::optional<uint32_t> threadCount;
+	std::optional<uint32_t> handleCount;
+	std::optional<uint32_t> gdiObjectCount;
+	std::optional<double> pageFaultRate;
 
 	// 네트워크 연결
 	std::vector<TargetNetConnection> connections;
 };
 
+// 타겟 상태 — TargetCollector::getStatus()와 SnapshotTarget::status가 함께 쓰는 유일한 정의 (proto TargetInfo::Status와 1:1).
+// 값을 추가하면 default 없는 switch(SnapshotConverter 등)에서 C4062 오류로 빌드가 멈춘다 (src/CMakeLists.txt의 /we4062).
+enum class TargetStatus {
+	RUNNING,      // 실행 중 → 실시간 수집
+	NOT_RUNNING,  // 꺼져 있음 → 마지막 데이터 표시
+	NEVER_SEEN    // 한 번도 수집된 적 없음
+};
+
 struct SnapshotTarget {
 	std::string targetName;
-	std::string exePath;
-	std::string status = "running"; // 메인 루프가 수집 시점에 계산: "running" | "not_running" | "never_seen"
+	std::optional<std::string> exePath;
+	TargetStatus status = TargetStatus::RUNNING; // 메인 루프가 수집 시점에 계산
 
-	// status가 "not_running"/"never_seen"일 때만 채워지는 마지막 세션 요약 (running이면 전부 기본값)
+	// status가 NOT_RUNNING/NEVER_SEEN일 때만 채워지는 마지막 세션 요약 (RUNNING이면 전부 기본값)
 	std::string lastSessionDate;
 	double lastAvgCpuUsage = 0.0;
 	double lastPeakCpuUsage = 0.0;
@@ -125,19 +141,20 @@ struct SnapshotTarget {
 
 	// 메인 프로세스
 	uint32_t pid = 0;
-	double cpuUsage = 0.0;
-	double memoryMB = 0.0;
-	double privateMemoryMB = 0.0;
-	double virtualMemoryMB = 0.0;
-	double diskReadMBs = 0.0;
-	double diskWriteMBs = 0.0;
+	std::string processName;	// 실제 실행 파일 이름(.exe 제외) — 이름 매칭이 대소문자를 무시하므로 targetName과 대소문자가 다를 수 있다
+	std::optional<double> cpuUsage;
+	std::optional<double> memoryMB;		// Working Set - Private
+	std::optional<double> privateMemoryMB;
+	std::optional<double> virtualMemoryMB;
+	std::optional<double> diskReadMBs;
+	std::optional<double> diskWriteMBs;
 	double netSentMbps = 0.0;
 	double netRecvMbps = 0.0;
-	uint32_t threadCount = 0;
-	uint32_t handleCount = 0;
-	uint32_t gdiObjectCount = 0;
-	double pageFaultRate = 0.0;
-	double elapsedSec = 0.0;
+	std::optional<uint32_t> threadCount;
+	std::optional<uint32_t> handleCount;
+	std::optional<uint32_t> gdiObjectCount;
+	std::optional<double> pageFaultRate;
+	std::optional<double> elapsedSec;
 
 	// 네트워크 연결 목록
 	std::vector<TargetNetConnection> connections;
@@ -145,7 +162,8 @@ struct SnapshotTarget {
 	// 자식 프로세스
 	std::vector<SnapshotChildProcess> children;
 
-	// 전체 합계 (메인 + 자식)
+	// 전체 합계 (메인 + 자식) — 서버로는 보내지 않는다.
+	// 값이 있는 것만 더한다: 값을 수집하지 못한 프로세스가 섞여 있으면(자식이 새로 생긴 틱 등) 합계는 그만큼 실제보다 작다.
 	double totalCpuUsage = 0.0;
 	double totalMemoryMB = 0.0;
 	double totalDiskMBs = 0.0;  // Read + Write
@@ -155,21 +173,21 @@ struct SnapshotTarget {
 	uint32_t totalProcessCount = 0;    // 메인 + 자식 수
 
 	void calcTotals() {
-		totalCpuUsage = cpuUsage;
-		totalMemoryMB = memoryMB;
-		totalDiskMBs = diskReadMBs + diskWriteMBs;
+		totalCpuUsage = cpuUsage.value_or(0.0);
+		totalMemoryMB = memoryMB.value_or(0.0);
+		totalDiskMBs = diskReadMBs.value_or(0.0) + diskWriteMBs.value_or(0.0);
 		totalNetMbps = netSentMbps + netRecvMbps;
-		totalThreadCount = threadCount;
-		totalHandleCount = handleCount;
+		totalThreadCount = threadCount.value_or(0);
+		totalHandleCount = handleCount.value_or(0);
 		totalProcessCount = 1 + static_cast<uint32_t>(children.size());
 
 		for (const auto& c : children) {
-			totalCpuUsage += c.cpuUsage;
-			totalMemoryMB += c.memoryMB;
-			totalDiskMBs += c.diskReadMBs + c.diskWriteMBs;
+			totalCpuUsage += c.cpuUsage.value_or(0.0);
+			totalMemoryMB += c.memoryMB.value_or(0.0);
+			totalDiskMBs += c.diskReadMBs.value_or(0.0) + c.diskWriteMBs.value_or(0.0);
 			totalNetMbps += c.netSentMbps + c.netRecvMbps;
-			totalThreadCount += c.threadCount;
-			totalHandleCount += c.handleCount;
+			totalThreadCount += c.threadCount.value_or(0);
+			totalHandleCount += c.handleCount.value_or(0);
 		}
 	}
 };

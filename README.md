@@ -14,21 +14,21 @@ SysMonitor Agent는 Windows PC에 설치되어 시스템/프로세스/타겟 프
 |------|------|------|
 | Phase 1 | gRPC 뼈대 (Agent ↔ Server 연결, 실시간/배치 채널) | ✅ 완료 |
 | Phase 2 | 인증 + 설정 파일 (`agent.ini`, api_key, 장비 식별) | ✅ 완료 |
-| Phase 3 | 실제 수집 데이터 전송 | 🔧 proto 구조만 선반영, 수집기 연결 예정 |
+| Phase 3 | 실제 수집 데이터 전송 | ✅ 완료 |
 | Phase 4 | 연결 끊김 처리 (재연결, 로컬 버퍼, 갭 전송) | 예정 |
 | Phase 9 | 로컬 폴백 모드 (`send_to_server = false`) | 예정 |
 
-지금 Agent는 서버에 연결해 **더미 스냅샷**(sys / proc / target)을 1초마다 보내고, 서버와 연결이 끊기거나 거부되면 원인을 로그로 남기고 종료합니다. 아래 설명 중 "(Phase N 예정)"으로 표시된 부분은 아직 구현되지 않은 목표 설계입니다.
+지금 Agent는 서버에 연결해 **실제 수집 스냅샷**(sys / proc 전체 목록 / target)을 1초마다 보내고, 서버와 연결이 끊기거나 거부되면 원인을 로그로 남기고 종료합니다. 아래 설명 중 "(Phase N 예정)"으로 표시된 부분은 아직 구현되지 않은 목표 설계입니다.
 
 ## 아키텍처
 
 ```
 SysMonitor Agent (Windows PC)
   │
-  ├── 수집기 (C++)                                    (Phase 3에서 연결 예정)
+  ├── 수집기 (C++)
   │     SystemCollector   PDH: CPU · 메모리 · 디스크 · 네트워크
   │     ProcessCollector  PDH 와일드카드 · ETW 네트워크 병합
-  │     TargetCollector   PDH Process V2 · 자식 프로세스 · ETW 통신
+  │     TargetCollector   PDH Process V2 · 자손 프로세스 · ETW 통신
   │
   ├── 실시간 채널 (gRPC Client Streaming)
   │     1초마다 sys / proc(전체 프로세스 목록) / target 스냅샷 전송
@@ -94,7 +94,7 @@ message AgentData {
 }
 ```
 
-- 모든 `string` 필드는 UTF-8이어야 합니다. 수집기는 Windows W API로 읽어 UTF-8로 변환합니다 (Phase 3 예정).
+- 모든 `string` 필드는 UTF-8이어야 합니다. 수집기는 Windows W API로 읽어 UTF-8로 변환합니다 (`util/StrUtil.h`, Phase 3-0).
 - `proto/sysmonitor.proto`는 SysMonitor-Server와 **같은 내용**이어야 합니다. 구조를 바꾸면 파일 안의 `PROTOCOL_VERSION_CURRENT`를 올립니다. 버전이 다르면 서버가 연결 시점에 거부합니다.
 
 ## 연결과 인증
@@ -171,7 +171,15 @@ cmake --build out/build/x64-Debug
 # 실행 — agent.ini가 있는 폴더에서 실행
 cd out/build/x64-Debug/src
 .\SysMonitorAgent.exe
+
+# 타겟 프로그램 지정 (개발용 임시 경로, 여러 번 반복 가능 — ".exe"는 붙여도 되고 빼도 됨)
+.\SysMonitorAgent.exe --target notepad --target 한글프로그램
 ```
+
+- 타겟 등록의 정식 경로는 통합 Web UI → 서버 → Agent 역방향 명령입니다 (Phase 7 예정). `--target`은 그 전까지 타겟 수집을 확인하기 위한 임시 옵션이라 `agent.ini`에는 두지 않았고, Phase 7에서 제거됩니다. 모르는 인자를 주면 오타가 무시되지 않도록 시작하지 않고 종료합니다.
+- 프로세스별 네트워크 사용량(ETW)은 **관리자 권한**으로 실행해야 수집됩니다. 권한이 없으면 경고만 남기고 네트워크 값은 0으로 보냅니다.
+- 타겟의 자식(`children`)은 메인 프로세스의 **자손 전체**입니다. **관리자 권한**으로 실행하면 프로세스 시작/종료 이벤트(ETW)를 받아, 1초 안에 끝나는 런처를 거쳐 실행된 프로세스까지 포함합니다. 권한이 없으면 경고만 남기고 1초마다의 프로세스 목록으로 찾으므로, 그런 프로세스는 빠질 수 있습니다.
+- 실행 중이던 타겟이 종료되면, 로컬 DB(Phase 4)가 붙기 전까지는 마지막 세션 요약 없이 "수집 기록 없음(NEVER_SEEN)"으로 보고됩니다.
 
 Visual Studio에서는 폴더 열기(`File > Open > Folder`)로 CMake 프로젝트를 바로 열 수 있습니다.
 
