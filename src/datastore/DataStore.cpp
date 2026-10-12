@@ -195,6 +195,12 @@ double DataStore::safeDouble(double v) {
     return v;
 }
 
+// 읽지 못한 값(std::optional 비어 있음)을 여기서는 0으로 저장한다 — 지금 이 저장 경로는 메인 루프에 연결돼 있지 않다.
+// 로컬 버퍼로 되살릴 때 NULL로 저장해야 갭 전송에서도 "읽지 못함"이 0으로 바뀌지 않는다 (아래 타겟 저장과 같은 사정).
+double DataStore::safeDouble(const std::optional<double>& v) {
+    return safeDouble(v.value_or(0.0));
+}
+
 // SnapShotProcData → DuckDB
 // SnapShotProcData.procs는 vector<SnapShotProc>이므로
 // 하나의 스냅샷에서 여러 행 INSERT

@@ -8,35 +8,37 @@
 // ---------------------------------------------------------------------------
 // 시스템
 // ---------------------------------------------------------------------------
+// std::optional 필드: 값이 없으면 "읽지 못함"이다 — 그 카운터가 없는 Windows이거나 그 틱의 수집이 실패했을 때.
+// 0은 실제로 0일 때만 넣는다 (proto SysSnapshot의 optional 필드와 1:1).
 struct SnapshotSysCpu {
-	double cpuTotal = 0.0;
-	double cpuFreqGHz = 0.0;
+	std::optional<double> cpuTotal;
+	std::optional<double> cpuFreqGHz;
 
-	double cpuUser = 0.0;
-	double cpuKernel = 0.0;
-	double cpuQueueLength = 0.0;
+	std::optional<double> cpuUser;
+	std::optional<double> cpuKernel;
+	std::optional<double> cpuQueueLength;
 };
 
 struct SnapshotSysMem {
-	double memTotalMB = 0.0;
-	double memUsagePercent = 0.0;
-	double memUsedMB = 0.0;
-	double memAvailMB = 0.0;
+	std::optional<double> memTotalMB;
+	std::optional<double> memUsagePercent;	// memTotalMB와 memAvailMB로 계산 — 둘 중 하나가 없으면 없다
+	std::optional<double> memUsedMB;		// 위와 같음
+	std::optional<double> memAvailMB;
 
-	double commitMemPercent = 0.0;
-	double committedMemGB = 0.0;
-	double commitLimitGB = 0.0;
+	std::optional<double> commitMemPercent;
+	std::optional<double> committedMemGB;
+	std::optional<double> commitLimitGB;
 };
 
 struct SnapshotSysDisk {
 	std::chrono::system_clock::time_point lastTime = std::chrono::system_clock::now();
-	double diskReadKBs = 0.0;
-	double diskWriteKBs = 0.0;
+	std::optional<double> diskReadKBs;
+	std::optional<double> diskWriteKBs;
 };
 
 struct SnapshotSysNet {
-	double netSentKbps = 0.0;
-	double netRecvKbps = 0.0;
+	std::optional<double> netSentKbps;
+	std::optional<double> netRecvKbps;
 };
 
 struct SnapshotSysData {
@@ -51,17 +53,19 @@ struct SnapshotSysData {
 // ---------------------------------------------------------------------------
 // 프로세스
 // ---------------------------------------------------------------------------
+// std::optional 필드(PDH에서 오는 지표): 값이 없으면 "읽지 못함"이다 — 그 카운터의 배열을 읽지 못한 틱,
+// 프로세스가 처음 보인 틱의 비율 값(CPU·디스크). 0은 실제로 0일 때만 넣는다 (proto ProcInfo의 optional 필드와 1:1).
 struct SnapshotProc {
 	uint32_t	procID = 0;
 	std::string procName;
 
-	double		procCpuUsage = 0.0;
+	std::optional<double>	procCpuUsage;
 
-	double		procMemoryMB = 0.0;
-	double		procPrivateMemoryMB = 0.0;
+	std::optional<double>	procMemoryMB;
+	std::optional<double>	procPrivateMemoryMB;
 
-	double		procDiskReadMBs = 0.0;
-	double		procDiskWriteMBs = 0.0;
+	std::optional<double>	procDiskReadMBs;
+	std::optional<double>	procDiskWriteMBs;
 
 	double		procNetSentMbps = 0.0;
 	double		procNetRecvMbps = 0.0;
@@ -111,7 +115,7 @@ struct SnapshotChildProcess {
 };
 
 // 타겟 상태 — TargetCollector::getStatus()와 SnapshotTarget::status가 함께 쓰는 유일한 정의 (proto TargetInfo::Status와 1:1).
-// 값을 추가하면 default 없는 switch(SnapshotConverter 등)에서 C4062 경고가 난다 (src/CMakeLists.txt의 /w14062).
+// 값을 추가하면 default 없는 switch(SnapshotConverter 등)에서 C4062 오류로 빌드가 멈춘다 (src/CMakeLists.txt의 /we4062).
 enum class TargetStatus {
 	RUNNING,      // 실행 중 → 실시간 수집
 	NOT_RUNNING,  // 꺼져 있음 → 마지막 데이터 표시

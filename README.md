@@ -28,7 +28,7 @@ SysMonitor Agent (Windows PC)
   ├── 수집기 (C++)
   │     SystemCollector   PDH: CPU · 메모리 · 디스크 · 네트워크
   │     ProcessCollector  PDH 와일드카드 · ETW 네트워크 병합
-  │     TargetCollector   PDH Process V2 · 자식 프로세스 · ETW 통신
+  │     TargetCollector   PDH Process V2 · 자손 프로세스 · ETW 통신
   │
   ├── 실시간 채널 (gRPC Client Streaming)
   │     1초마다 sys / proc(전체 프로세스 목록) / target 스냅샷 전송
@@ -178,6 +178,7 @@ cd out/build/x64-Debug/src
 
 - 타겟 등록의 정식 경로는 통합 Web UI → 서버 → Agent 역방향 명령입니다 (Phase 7 예정). `--target`은 그 전까지 타겟 수집을 확인하기 위한 임시 옵션이라 `agent.ini`에는 두지 않았고, Phase 7에서 제거됩니다. 모르는 인자를 주면 오타가 무시되지 않도록 시작하지 않고 종료합니다.
 - 프로세스별 네트워크 사용량(ETW)은 **관리자 권한**으로 실행해야 수집됩니다. 권한이 없으면 경고만 남기고 네트워크 값은 0으로 보냅니다.
+- 타겟의 자식(`children`)은 메인 프로세스의 **자손 전체**입니다. **관리자 권한**으로 실행하면 프로세스 시작/종료 이벤트(ETW)를 받아, 1초 안에 끝나는 런처를 거쳐 실행된 프로세스까지 포함합니다. 권한이 없으면 경고만 남기고 1초마다의 프로세스 목록으로 찾으므로, 그런 프로세스는 빠질 수 있습니다.
 - 실행 중이던 타겟이 종료되면, 로컬 DB(Phase 4)가 붙기 전까지는 마지막 세션 요약 없이 "수집 기록 없음(NEVER_SEEN)"으로 보고됩니다.
 
 Visual Studio에서는 폴더 열기(`File > Open > Folder`)로 CMake 프로젝트를 바로 열 수 있습니다.

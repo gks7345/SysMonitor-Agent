@@ -12,6 +12,7 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <iphlpapi.h>
+#include <array>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -54,6 +55,11 @@ struct ProcessPerf {
 struct TrackedProcess {
 	DWORD pid = 0;
 	std::string exeName;	// 실제 실행 파일 이름(.exe 제외) — 스냅샷의 이름과 생존 판정(isAlive)에 쓴다
+
+	// 프로세스 시작 이벤트로 알게 됐지만 아직 프로세스 목록에서 보지 못했다 (이번 틱의 목록을 뜬 뒤에 생겼다).
+	// 이름을 모르므로 스냅샷에는 넣지 않는다. 곧 목록에 나타나면 확정하고, 나타나지 않으면(그 사이 종료) 지운다.
+	bool unconfirmed = false;
+	uint64_t adoptedList = 0;	// unconfirmed일 때: 알게 된 시점의 목록 번호
 };
 
 struct TargetEntry {
@@ -63,12 +69,17 @@ struct TargetEntry {
 	DWORD pid = 0;				// 메인 프로세스
 	std::vector<TrackedProcess> children;	// 메인의 자손 전체 (자식의 자식까지, 평평하게) — syncChildren()이 관리
 	bool limitedAccessWarned = false;	// "권한이 없어 일부 지표를 수집하지 못함" 경고를 이미 남겼는가 (활성화당 1번)
+
+	// 프로세스 시작 이벤트를 받을 때 "이 타겟의 식구"로 치는 PID -> 마지막으로 프로세스 목록에서 본 목록 번호.
+	// 메인과 자손에 더해, 방금 종료된 자손도 잠시 남겨 둔다: 이벤트는 프로세스 목록보다 늦게 도착할 수 있어서,
+	// 런처가 목록에서 사라진 뒤에 "런처가 작업 프로세스를 만들었다"는 이벤트가 올 수 있다.
+	std::unordered_map<DWORD, uint64_t> lineage;
+	uint64_t activatedList = 0;	// 활성화된 시점의 목록 번호
 };
 
 // 타겟 프로세스
 class TargetCollector {
 private:
-	int cleanupTick = 5;
 	std::vector<TargetEntry> activeTargets;
 	// 등록된 타겟 이름 목록 (실행 여부 무관)
 	std::vector<std::string> registeredNames;
@@ -82,9 +93,28 @@ private:
 	// "\Process V2(*)" 와일드카드 카운터를 담은 쿼리 하나 — 프로세스마다 카운터를 등록하지 않는다 (collectProcessPerf 참고)
 	PDH_HQUERY query = nullptr;
 	std::vector<PDH_HCOUNTER> perfCounters;	// 등록에 실패한 카운터는 nullptr (그 지표는 계속 "없음")
+	// 읽기 실패를 이미 알렸는가 (PdhUtil::reportReadState) — 쿼리 수집에 하나, 카운터의 배열마다 하나 (perfCounters와 같은 순서)
+	static constexpr size_t PERF_COUNTER_COUNT = 10;
+	bool perfCollectWarned = false;
+	std::array<bool, PERF_COUNTER_COUNT> perfReadFailWarned{};
 	std::vector<char> perfBuffer;			// 배열 읽기용 버퍼 — 매 틱 다시 할당하지 않고 재사용
 	bool perfCollectedLastTick = false;		// 직전 틱에 수집했는가 — 아니면 이번 수집의 비율 값은 쓸 수 없다
 	std::unordered_map<DWORD, NetMbps> netThisTick;	// 이번 틱에 이미 읽은 ETW 네트워크 값 (readNet)
+
+	// 프로세스가 프로세스 목록에 처음 보인 순서 (PID -> 몇 번째 목록에서 처음 보였는가).
+	// 부모 PID만으로는 진짜 부모인지 알 수 없어서(부모가 종료된 뒤 그 PID가 다른 프로세스에 재사용될 수 있다)
+	// 자손을 고를 때 이 순서를 함께 본다 — appearedBefore()
+	struct FirstSeen {
+		uint64_t firstList = 0;	// 처음 보인 목록의 번호 (1부터)
+		uint64_t lastList = 0;	// 마지막으로 보인 목록의 번호 — 최신 목록에 없으면 종료된 것이라 지운다
+		std::wstring exeName;	// 같은 PID인데 이름이 달라졌으면 다른 프로세스다 (그 사이 PID가 재사용됨)
+	};
+	std::unordered_map<DWORD, FirstSeen> firstSeen;
+	uint64_t listCount = 0;		// 지금까지 받은 프로세스 목록의 수
+
+	// 직전 틱에 받은 프로세스 이벤트 — 이번 틱에 활성화된 타겟에 한 번 더 적용한다
+	// (타겟이 시작하자마자 만든 프로세스의 이벤트가, 그 타겟이 프로세스 목록에 보이기 전에 먼저 도착했을 수 있다)
+	std::vector<ProcessEvent> lastProcessEvents;
 
 	ETWNetwork& etwNet;
 
@@ -141,8 +171,8 @@ private:
 	// 실행 중인 타겟이 있으면 PDH를 한 번 수집해, 타겟/자식의 PID에 해당하는 값을 돌려준다.
 	// nullopt = 수집 자체가 실패(이번 틱은 값을 알 수 없음). 맵에 PID가 없으면 PDH 배열에 그 프로세스가 없었던 것이다.
 	std::optional<PerfMap> collectProcessPerf();
-	// 카운터 하나의 배열을 읽어 wanted에 든 PID의 값을 out의 field에 채운다
-	void readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out);
+	// 카운터 하나의 배열을 읽어 wanted에 든 PID의 값을 out의 field에 채운다. 반환: 배열 읽기의 PDH 상태 (ERROR_SUCCESS가 아니면 out은 그대로)
+	PDH_STATUS readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out);
 
 	// procs: 이번 틱의 프로세스 목록 — 자식의 생존 판정에 쓴다. nullptr = 이번 틱은 목록을 못 받음(자식을 그대로 수집)
 	// perf: 이번 틱의 PDH 값. nullptr = PDH 수집 실패(값을 모두 비운 채 보낸다)
@@ -155,6 +185,14 @@ private:
 
 	// 자손 목록 동기화 — 이번 틱의 프로세스 목록에서 메인의 자손(자식의 자식까지)을 추가하고, 목록에서 사라진 것을 제거한다
 	void syncChildren(TargetEntry& entry, const ProcessList& procs);
+	// 프로세스 시작/종료 이벤트를 순서대로 따라가며 자손을 더하고 뺀다 (ETW 세션이 열렸을 때만 이벤트가 온다).
+	// 프로세스 목록은 1초에 한 번의 단면이라, 런처가 작업 프로세스를 띄우고 그 사이에 끝나면 부모 PID로 따라갈 길이 없다 —
+	// 이벤트에는 그 순간의 실제 부모가 들어 있다. 이벤트가 없으면(권한 없음) 아무 일도 하지 않고 syncChildren()만으로 동작한다.
+	void applyProcessEvents(TargetEntry& entry, const std::vector<ProcessEvent>& events, const ProcessList& procs);
+	// 이번 틱의 프로세스 목록으로 firstSeen을 갱신한다 — 새로 보인 프로세스에 번호를 매기고, 사라진 것을 지운다
+	void updateFirstSeen(const ProcessList& procs);
+	// pid가 otherPid보다 앞선 목록에서 처음 보였는가. 둘 중 하나라도 기록이 없으면 false (판단하지 않는다)
+	bool appearedBefore(DWORD pid, DWORD otherPid) const;
 	// ETW 네트워크 값을 PID당 틱에 한 번만 읽는다 (읽으면 누적값이 리셋되므로 — 같은 PID가 두 타겟에 걸칠 수 있다)
 	NetMbps readNet(DWORD pid, double elapsedSec);
 
@@ -211,7 +249,8 @@ public:
 
 	// procs: 메인 루프가 이번 틱에 뜬 프로세스 목록 (takeProcessList) — 시작 감지, 메인·자손의 생존 확인, 자손 동기화가 함께 쓴다.
 	// nullopt(목록을 못 받음)이면 이번 틱은 시작/종료 판정을 모두 건너뛰고 직전 상태를 유지한다.
-	void collect(const std::optional<ProcessList>& procs);
+	// tickTime: 메인 루프가 정한 이번 틱의 시각 — 스냅샷의 timestamp가 된다
+	void collect(const std::optional<ProcessList>& procs, std::chrono::system_clock::time_point tickTime);
 
 	// 결과 조회
 	const SnapshotTargetData& getSnapshot() const { return snapshot; }

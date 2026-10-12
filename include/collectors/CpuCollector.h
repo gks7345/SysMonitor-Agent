@@ -8,18 +8,19 @@
 
 class CpuCollector {
 private:
-	PDH_HCOUNTER cpuTotal;
-	PDH_HCOUNTER cpuFreqMHz;
+	PDH_HCOUNTER cpuTotal = nullptr;
+	PDH_HCOUNTER cpuFreqMHz = nullptr;
 
-	PDH_HCOUNTER cpuUser;
-	PDH_HCOUNTER cpuKernel;
-	PDH_HCOUNTER cpuQueueLength;
+	PDH_HCOUNTER cpuUser = nullptr;
+	PDH_HCOUNTER cpuKernel = nullptr;
+	PDH_HCOUNTER cpuQueueLength = nullptr;
 
 public:
 	void init(PDH_HQUERY& query);
-	double getTotalUsage() const;
-	double getCpuFreqGHz() const;
-	double getCpuQueueLength() const;
-	double getCpuUser() const;
-	double getCpuKernel() const;
+	// 읽지 못한 값은 0이 아니라 "없음"으로 돌려준다 (PdhUtil::Reading)
+	PdhUtil::Reading getTotalUsage() const;
+	PdhUtil::Reading getCpuFreqGHz() const;
+	PdhUtil::Reading getCpuQueueLength() const;
+	PdhUtil::Reading getCpuUser() const;
+	PdhUtil::Reading getCpuKernel() const;
 };
