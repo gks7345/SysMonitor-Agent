@@ -1,4 +1,5 @@
 ﻿#include "collectors/TargetCollector.h"
+#include "util/PdhUtil.h"
 #include "util/StrUtil.h"
 
 // 문자열 규칙 : 타겟/프로세스 이름·경로는 전부 UTF-8 std::string으로 다룬다.
@@ -38,6 +39,12 @@ namespace {
 
 	constexpr double BYTES_PER_MB = 1024.0 * 1024.0;
 
+	// 프로세스 이벤트는 프로세스 목록보다 조금 늦게 도착할 수 있다 (ETW가 버퍼에 모았다가 넘긴다).
+	// 이벤트로 알게 된 자손을 목록에서 못 봤다고 바로 지우지 않고 기다리는 틱 수,
+	// 그리고 목록에서 사라진 PID를 "식구"로 남겨 두어 뒤늦게 온 이벤트의 부모로 인정하는 틱 수.
+	constexpr uint64_t UNCONFIRMED_GRACE_LISTS = 2;
+	constexpr uint64_t LINEAGE_GRACE_LISTS = 3;
+
 	std::optional<double> bytesToMB(std::optional<double> bytes) {
 		if (!bytes) return std::nullopt;
 		return *bytes / BYTES_PER_MB;
@@ -75,25 +82,27 @@ namespace {
 
 	// 수집하는 카운터. isRate: 두 시점의 차이로 계산되는 값 — 직전 수집이 바로 앞 틱이 아니면 쓸 수 없다.
 	struct PerfCounterDef {
-		const wchar_t* name;
+		const char* name;
 		std::optional<double> ProcessPerf::* field;
 		bool isRate;
 	};
 	constexpr PerfCounterDef PERF_COUNTERS[] = {
-		{ L"% Processor Time",      &ProcessPerf::cpuPercent,             true  },
-		{ L"Working Set - Private", &ProcessPerf::workingSetPrivateBytes, false },
-		{ L"Private Bytes",         &ProcessPerf::privateBytes,           false },
-		{ L"Virtual Bytes",         &ProcessPerf::virtualBytes,           false },
-		{ L"IO Read Bytes/sec",     &ProcessPerf::ioReadBytesPerSec,      true  },
-		{ L"IO Write Bytes/sec",    &ProcessPerf::ioWriteBytesPerSec,     true  },
-		{ L"Thread Count",          &ProcessPerf::threadCount,            false },
-		{ L"Handle Count",          &ProcessPerf::handleCount,            false },	// 프로세스를 열 권한이 없어도 읽힌다
-		{ L"Page Faults/sec",       &ProcessPerf::pageFaultsPerSec,       true  },
-		{ L"Elapsed Time",          &ProcessPerf::elapsedSec,             false },
+		{ "% Processor Time",      &ProcessPerf::cpuPercent,             true  },
+		{ "Working Set - Private", &ProcessPerf::workingSetPrivateBytes, false },
+		{ "Private Bytes",         &ProcessPerf::privateBytes,           false },
+		{ "Virtual Bytes",         &ProcessPerf::virtualBytes,           false },
+		{ "IO Read Bytes/sec",     &ProcessPerf::ioReadBytesPerSec,      true  },
+		{ "IO Write Bytes/sec",    &ProcessPerf::ioWriteBytesPerSec,     true  },
+		{ "Thread Count",          &ProcessPerf::threadCount,            false },
+		{ "Handle Count",          &ProcessPerf::handleCount,            false },	// 프로세스를 열 권한이 없어도 읽힌다
+		{ "Page Faults/sec",       &ProcessPerf::pageFaultsPerSec,       true  },
+		{ "Elapsed Time",          &ProcessPerf::elapsedSec,             false },
 	};
 } // namespace
 
 TargetCollector::TargetCollector(ETWNetwork& sharedEtwNet) : etwNet(sharedEtwNet) {
+	static_assert(std::size(PERF_COUNTERS) == PERF_COUNTER_COUNT, "perfReadFailWarned needs one entry per counter");
+
 	cores = std::thread::hardware_concurrency();
 	if (cores == 0) cores = 1;
 
@@ -106,13 +115,8 @@ TargetCollector::TargetCollector(ETWNetwork& sharedEtwNet) : etwNet(sharedEtwNet
 		// 카운터는 여기서 한 번만 등록한다. 영문 이름으로 등록해 다른 언어의 Windows에서도 같은 경로가 통하게 한다.
 		perfCounters.resize(std::size(PERF_COUNTERS), nullptr);
 		for (size_t i = 0; i < std::size(PERF_COUNTERS); ++i) {
-			const std::wstring path = std::wstring(L"\\Process V2(*)\\") + PERF_COUNTERS[i].name;
-			s = PdhAddEnglishCounterW(query, path.c_str(), 0, &perfCounters[i]);
-			if (s != ERROR_SUCCESS) {
-				perfCounters[i] = nullptr;
-				spdlog::error("TargetCollector: counter '{}' could not be added (0x{:X}) — that metric will be unavailable",
-					StrUtil::wideToUtf8(path), static_cast<unsigned>(s));
-			}
+			const std::wstring path = L"\\Process V2(*)\\" + StrUtil::utf8ToWide(PERF_COUNTERS[i].name);
+			PdhUtil::addCounter(query, path.c_str(), perfCounters[i], "TargetCollector");
 		}
 	}
 
@@ -316,20 +320,21 @@ std::optional<TargetCollector::PerfMap> TargetCollector::collectProcessPerf() {
 
 	const PDH_STATUS s = PdhCollectQueryData(query);
 	perfCollectedLastTick = (s == ERROR_SUCCESS);
-	if (s != ERROR_SUCCESS) {
-		spdlog::warn("TargetCollector: PdhCollectQueryData failed (0x{:X}) — target metrics are unavailable this tick", static_cast<unsigned>(s));
-		return std::nullopt;
-	}
+	PdhUtil::reportReadState(perfCollectWarned, s == ERROR_SUCCESS, "TargetCollector", "PdhCollectQueryData (every target metric)", s);
+	if (s != ERROR_SUCCESS) return std::nullopt;
 
 	for (size_t i = 0; i < std::size(PERF_COUNTERS) && i < perfCounters.size(); ++i) {
 		if (!perfCounters[i]) continue;
 		if (PERF_COUNTERS[i].isRate && !ratesValid) continue;
-		readPerfArray(perfCounters[i], PERF_COUNTERS[i].field, wanted, result);
+
+		// 배열을 읽지 못하면 그 지표는 이번 틱에 모든 타겟에서 "값 없음"으로 나간다 — 서버에서는 원인을 알 수 없으므로 여기에 남긴다.
+		const PDH_STATUS rs = readPerfArray(perfCounters[i], PERF_COUNTERS[i].field, wanted, result);
+		PdhUtil::reportReadState(perfReadFailWarned[i], rs == ERROR_SUCCESS, "TargetCollector", PERF_COUNTERS[i].name, rs);
 	}
 	return result;
 }
 
-void TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out) {
+PDH_STATUS TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> ProcessPerf::* field, const std::unordered_set<DWORD>& wanted, PerfMap& out) {
 	// PDH_FMT_NOCAP100: 프로세스의 "% Processor Time"은 코어 하나를 다 쓰면 100, 둘이면 200이다.
 	// 이 플래그가 없으면 PDH가 100에서 잘라, 여러 코어를 쓰는 프로세스가 (100 / 코어 수)%로 낮게 보고된다.
 	constexpr DWORD format = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
@@ -343,10 +348,7 @@ void TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> 
 			perfBuffer.empty() ? nullptr : reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(perfBuffer.data()));
 		if (s == PDH_MORE_DATA) perfBuffer.resize(size);
 	}
-	if (s != ERROR_SUCCESS) {
-		spdlog::debug("TargetCollector: PdhGetFormattedCounterArray failed (0x{:X})", static_cast<unsigned>(s));
-		return;
-	}
+	if (s != ERROR_SUCCESS) return s;	// 알릴지는 호출부가 정한다 (매 틱 불리므로 여기서 로그를 찍지 않는다)
 
 	const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(perfBuffer.data());
 	for (DWORD i = 0; i < count; ++i) {
@@ -364,6 +366,7 @@ void TargetCollector::readPerfArray(PDH_HCOUNTER counter, std::optional<double> 
 		if (std::isnan(value) || std::isinf(value)) continue;
 		perf.*field = value;
 	}
+	return ERROR_SUCCESS;
 }
 
 // -------------------------------------------------------
@@ -433,11 +436,12 @@ SnapshotTarget TargetCollector::collectTarget(TargetEntry& entry, double elapsed
 	s.connections = lookupConnections(connMap, entry.pid);
 
 	// 자식 프로세스 수집
-	// syncChildren()이 최대 5초 주기로만 목록을 정리하므로, 그 사이 이미 종료된 자식이
-	// entry.children에 남아있을 수 있다 — 이번 틱의 프로세스 목록에 없으면 수집하지 않고 스냅샷에서 제외한다
-	// (값이 빈 유령 항목이 서버로 나가는 것을 방지). 판정은 메인과 같은 목록, 같은 규칙(PID + 이름)이다.
+	// 이번 틱의 프로세스 목록에 없는 자식은 수집하지 않고 스냅샷에서 제외한다 (값이 빈 유령 항목이 서버로 나가는 것을 방지).
+	// 판정은 메인과 같은 목록, 같은 규칙(PID + 이름)이다. syncChildren()이 같은 틱에 같은 목록으로 이미 정리하므로
+	// 보통은 걸리는 것이 없다 — 이 함수가 그 호출 순서에 기대지 않도록 여기서도 확인한다.
 	// 목록을 못 받은 틱(procs == nullptr)은 생존 여부를 알 수 없으므로 유령으로 단정하지 않고 그대로 수집한다.
 	for (const auto& child : entry.children) {
+		if (child.unconfirmed) continue;	// 이벤트로만 알고 아직 목록에서 보지 못했다 — 이름을 모른다
 		if (procs && !isAlive(*procs, child.pid, child.exeName)) continue;
 
 		// PDH 수집은 됐는데 배열에 이 자식이 없다 — 프로세스 목록을 뜬 직후 종료된 경우다. 이번 틱은 뺀다.
@@ -473,6 +477,8 @@ bool TargetCollector::activateTarget(const std::string& name, const RunningProce
 	entry.targetName = name;
 	entry.exeName = proc.exeName;
 	entry.pid = proc.pid;
+	entry.activatedList = listCount;
+	entry.lineage[proc.pid] = listCount;
 
 	if (proc.exeName != name) {
 		spdlog::info("TargetCollector: '{}' matched process '{}.exe' (names are case-insensitive)", name, proc.exeName);
@@ -507,46 +513,170 @@ void TargetCollector::syncChildren(TargetEntry& entry, const ProcessList& procs)
 	// 추가보다 먼저 한다: PID가 다른 프로세스에 재사용된 경우 옛 항목을 지워야 아래에서 새 프로세스로 다시 볼 수 있다.
 	// 한 번 잡힌 자손은 살아 있는 동안 유지한다 — 중간 프로세스가 먼저 종료돼(cmd는 끝나고 작업 프로세스만 남음)
 	// 메인에서 더 이상 따라갈 수 없게 돼도 빼지 않는다.
+	//
+	// 이벤트로 알게 된 자손(unconfirmed)은 목록보다 먼저 알았을 수 있으므로 바로 지우지 않는다:
+	// 목록에 나타나면 이름을 채워 확정하고, 몇 틱이 지나도 나타나지 않으면 그 사이 종료된 것으로 본다.
+	for (auto& c : entry.children) {
+		if (!c.unconfirmed) continue;
+		const auto it = std::find_if(procs.begin(), procs.end(), [&](const ProcessListEntry& p) { return p.pid == c.pid; });
+		if (it == procs.end()) continue;
+		c.exeName = StrUtil::wideToUtf8(it->exeName);
+		c.unconfirmed = false;
+	}
 	entry.children.erase(std::remove_if(entry.children.begin(), entry.children.end(),
-		[&](const TrackedProcess& c) { return !isAlive(procs, c.pid, c.exeName); }), entry.children.end());
+		[&](const TrackedProcess& c) {
+			if (c.unconfirmed) return listCount - c.adoptedList >= UNCONFIRMED_GRACE_LISTS;
+			return !isAlive(procs, c.pid, c.exeName);
+		}), entry.children.end());
 
 	// 새 자손 추가 — 이번 틱의 프로세스 목록에서 메인부터 부모 PID를 따라 내려간다 (스냅샷을 따로 뜨지 않는다).
 	// 실행 파일이 부모와 달라도 포함한다 (스크립트가 띄운 프로그램, 콘솔 프로그램의 conhost 등).
 	//
-	// 한계: Windows는 부모가 종료돼도 자식에 기록된 부모 PID를 고치지 않는다. 죽은 프로세스의 PID를
-	// 이 타겟의 메인이나 자손이 물려받으면, 그 죽은 프로세스의 자식이 여기서 자손으로 잘못 잡힐 수 있다.
-	// 프로세스 생성 시각을 비교하면 막을 수 있지만 ToolHelp 목록에는 생성 시각이 없다.
+	// 부모 PID가 같다고 다 자식은 아니다: Windows는 부모가 종료돼도 자식에 기록된 부모 PID를 고치지 않아서,
+	// 죽은 프로세스의 PID를 이 타겟의 메인이나 자손이 물려받으면 그 죽은 프로세스의 자식이 부모 PID만으로는
+	// 이 타겟의 자손으로 보인다 (실측: 무관한 프로세스가 children에 잡혔다). 진짜 자식은 부모보다 먼저 있을 수 없으므로,
+	// 부모보다 앞선 목록에서 처음 보인 프로세스는 건너뛴다 (appearedBefore).
+	// 한계: 순서를 틱 단위로만 안다. Agent가 시작되기 전부터 있던 프로세스끼리, 그리고 한 틱 안에
+	// "부모 종료 → 그 PID 재사용"이 모두 일어난 경우는 가리지 못하고 부모 PID를 믿는다.
+	//
+	// 메인뿐 아니라 이미 잡힌 자손에서도 출발한다: 중간 프로세스가 종료돼 메인에서는 닿지 않게 된 자손이
+	// 그 뒤에 새로 띄운 프로세스도 이 타겟의 자손이다.
 	std::vector<DWORD> frontier{ entry.pid };
 	std::unordered_set<DWORD> visited{ entry.pid };	// 같은 PID를 두 번 따라가지 않는다 (부모 관계가 순환해 보여도 끝난다)
+	for (const auto& c : entry.children) {
+		if (c.unconfirmed) continue;
+		if (visited.insert(c.pid).second) frontier.push_back(c.pid);
+	}
 	while (!frontier.empty()) {
 		const DWORD parent = frontier.back();
 		frontier.pop_back();
 
 		for (const auto& p : procs) {
 			if (p.ppid != parent) continue;
+			if (appearedBefore(p.pid, parent)) continue;
 			if (!visited.insert(p.pid).second) continue;
 			frontier.push_back(p.pid);
 
-			bool exists = std::any_of(entry.children.begin(), entry.children.end(),
-				[&](const TrackedProcess& c) { return c.pid == p.pid; });
+			bool exists = std::any_of(entry.children.begin(), entry.children.end(), [&](const TrackedProcess& c) { return c.pid == p.pid; });
 			if (exists) continue;
 
 			entry.children.push_back(TrackedProcess{ p.pid, StrUtil::wideToUtf8(p.exeName) });
 		}
 	}
+
+	// 식구 목록 갱신 — 지금 살아 있는 메인과 자손. 목록에서 사라진 PID는 바로 빼지 않고 몇 틱 남겨 둔다 (TargetEntry::lineage 참고).
+	entry.lineage[entry.pid] = listCount;
+	for (const auto& c : entry.children) {
+		if (!c.unconfirmed) entry.lineage[c.pid] = listCount;
+	}
+	for (auto it = entry.lineage.begin(); it != entry.lineage.end();) {
+		if (listCount - it->second >= LINEAGE_GRACE_LISTS) it = entry.lineage.erase(it);
+		else ++it;
+	}
+}
+
+// -------------------------------------------------------
+// 프로세스 시작/종료 이벤트 반영
+// 이벤트를 발생 순서대로 따라간다: 식구(lineage)가 만든 프로세스는 자손으로 올리고 식구에 넣는다 — 그래서
+// "메인이 런처를 만듦 → 런처가 작업 프로세스를 만듦 → 런처 종료"가 한 틱 안에 일어나도 작업 프로세스까지 닿는다.
+// 순서가 중요하다: 종료 이벤트 뒤에 같은 PID로 온 시작 이벤트는 다른 프로세스다.
+// -------------------------------------------------------
+void TargetCollector::applyProcessEvents(TargetEntry& entry, const std::vector<ProcessEvent>& events, const ProcessList& procs) {
+	const auto eraseChild = [&](DWORD pid) {
+		entry.children.erase(std::remove_if(entry.children.begin(), entry.children.end(), [&](const TrackedProcess& c) { return c.pid == pid; }), entry.children.end());
+		};
+
+	// 메인 자신의 시작 이벤트가 들어 있으면 그 뒤부터 본다. 그 앞의 이벤트에 나오는 같은 PID는
+	// 이 PID를 먼저 쓰던 다른 프로세스이고, 그 프로세스가 만든 것들은 이 타겟의 자손이 아니다.
+	// 메인의 시작 이벤트는 PID만으로 고른다 — 메인 PID로 온 시작 이벤트 중 마지막 것을 메인의 것으로 가정한다.
+	// 한계: 이번 틱의 목록을 뜬 뒤에 메인이 종료되고 그 PID가 재사용됐다면 마지막 시작 이벤트는 새 프로세스의 것이라,
+	// 메인의 자손을 건너뛰고 새 프로세스가 만든 것을 자손으로 올린다. 그렇게 올라간 것은 이번 목록에 없어 스냅샷에
+	// 들어가지 않고, 다음 틱에 메인이 종료로 판정된다 (새 프로세스의 이름이 메인과 같으면 가리지 못한다).
+	size_t begin = 0;
+	for (size_t i = 0; i < events.size(); ++i) {
+		if (events[i].isStart && events[i].pid == entry.pid) begin = i + 1;
+	}
+
+	for (size_t i = begin; i < events.size(); ++i) {
+		const ProcessEvent& ev = events[i];
+
+		if (!ev.isStart) {
+			// 종료 — 이 PID가 만드는 프로세스를 더는 식구로 받지 않는다. 메인의 종료 처리는 collect()가 프로세스 목록으로 한다.
+			entry.lineage.erase(ev.pid);
+			if (ev.pid != entry.pid) eraseChild(ev.pid);
+			continue;
+		}
+
+		if (entry.lineage.count(ev.parentPid) == 0) {
+			// 식구로 알고 있던 PID가 식구 아닌 부모에게서 새로 시작됐다 — 그 PID는 종료된 뒤 무관한 프로세스에 재사용된 것이다
+			if (ev.pid != entry.pid && entry.lineage.erase(ev.pid) > 0) eraseChild(ev.pid);
+			continue;
+		}
+
+		// 식구가 만든 프로세스 — 자손이다
+		entry.lineage[ev.pid] = listCount;
+		const bool exists = std::any_of(entry.children.begin(), entry.children.end(), [&](const TrackedProcess& c) { return c.pid == ev.pid; });
+		if (exists) continue;
+
+		TrackedProcess child;
+		child.pid = ev.pid;
+		const auto it = std::find_if(procs.begin(), procs.end(), [&](const ProcessListEntry& p) { return p.pid == ev.pid; });
+		if (it != procs.end()) {
+			child.exeName = StrUtil::wideToUtf8(it->exeName);
+		}
+		else {
+			// 이번 틱의 목록에 없다: 목록을 뜬 뒤에 생겼거나 이미 종료됐다. 종료됐다면 종료 이벤트가 뒤따라 와서 지워진다.
+			child.unconfirmed = true;
+			child.adoptedList = listCount;
+		}
+		entry.children.push_back(std::move(child));
+	}
+}
+
+// -------------------------------------------------------
+// 프로세스가 처음 보인 순서
+// 매 틱의 프로세스 목록만으로 "어느 프로세스가 먼저 있었는가"를 틱 단위로 안다 — 생성 시각을 따로 얻지 않는다
+// (프로세스를 열어 읽는 방법은 권한이 없으면 절반가량 실패한다).
+// -------------------------------------------------------
+void TargetCollector::updateFirstSeen(const ProcessList& procs) {
+	++listCount;
+	for (const auto& p : procs) {
+		FirstSeen& seen = firstSeen[p.pid];
+		// 처음 보는 PID이거나, 같은 PID인데 이름이 달라졌다(틱 사이에 종료되고 그 PID가 재사용됨) — 새 프로세스로 센다
+		if (seen.firstList == 0 || !sameExeName(seen.exeName, p.exeName)) {
+			seen.firstList = listCount;
+			seen.exeName = p.exeName;
+		}
+		seen.lastList = listCount;
+	}
+	// 이번 목록에 없는 PID는 종료됐다. 지워야 그 PID가 나중에 다시 나타났을 때 새 프로세스로 센다
+	for (auto it = firstSeen.begin(); it != firstSeen.end();) {
+		if (it->second.lastList != listCount) it = firstSeen.erase(it);
+		else ++it;
+	}
+}
+
+bool TargetCollector::appearedBefore(DWORD pid, DWORD otherPid) const {
+	const auto a = firstSeen.find(pid);
+	const auto b = firstSeen.find(otherPid);
+	if (a == firstSeen.end() || b == firstSeen.end()) return false;
+	return a->second.firstList < b->second.firstList;
 }
 
 // -------------------------------------------------------
 // 전체 수집
 // -------------------------------------------------------
-void TargetCollector::collect(const std::optional<ProcessList>& procs) {
+void TargetCollector::collect(const std::optional<ProcessList>& procs, std::chrono::system_clock::time_point tickTime) {
 	// 등록된 타겟이 하나도 없어도 snapshot은 항상 "타겟 없음"으로 최신 상태를 반영해야 한다.
 	// 이 초기화를 아래 조기 반환보다 뒤에 두면, 마지막 타겟을 해제한 뒤에도 snapshot이
 	// 그 직전(심지어 running이었던) 상태로 얼어붙어 버려서 SysMonitor.cpp가 매 틱 그대로
 	// DataStore에 재전송하게 된다 — API가 이미 해제된 타겟을 영원히 "실행 중"으로 보고하고,
 	// flushTargetToDBInternal()이 동일 타임스탬프 행을 계속 재삽입하는 원인이 된다.
-	snapshot.timestamp = std::chrono::system_clock::now();
+	snapshot.timestamp = tickTime;
 	snapshot.targets.clear();
+
+	// 등록된 타겟이 없어도 갱신한다 — 순서는 지켜본 동안의 것만 알 수 있어서, 타겟이 나중에 등록돼도 그 전의 순서가 남아 있어야 한다
+	if (procs) updateFirstSeen(*procs);
 
 	if (registeredNames.empty()) return;
 
@@ -576,12 +706,33 @@ void TargetCollector::collect(const std::optional<ProcessList>& procs) {
 		}
 	}
 
-	// 자식 동기화 — 5초마다. 같은 프로세스 목록을 그대로 쓴다.
-	// 목록을 못 받은 틱에는 하지 않고 다음 틱에 다시 시도한다 (cleanupTick을 되돌리지 않음).
-	if (++cleanupTick >= 5 && procs) {
+	// 자손 동기화 — 매 틱. 같은 프로세스 목록을 그대로 쓴다 (PDH에 등록할 것이 없어, 드는 비용은 목록을 훑는 것뿐이다).
+	// 주기를 두고 띄엄띄엄 하면, 그 사이에 작업 프로세스를 띄우고 끝난 중간 프로세스(런처)를 보지 못해
+	// 그 아래 프로세스로 내려갈 부모 PID의 연결이 끊긴다 — 작업 프로세스가 살아 있는 내내 자손으로 잡히지 않는다.
+	// 매 틱 해도 틱 사이(1초 미만)에 시작해서 끝나는 런처는 여전히 놓친다.
+	// 목록을 못 받은 틱에는 하지 않는다.
+	//
+	// 그 앞에 프로세스 시작/종료 이벤트를 먼저 반영한다 (ETW 세션이 열린 경우에만 이벤트가 있다 — 관리자 권한 필요).
+	// 이벤트는 목록이 있는 틱에만 꺼낸다: 목록 없이는 이벤트로 알게 된 프로세스가 살아 있는지 확인할 수 없다.
+	// 꺼내지 않은 이벤트는 다음 틱까지 쌓여 있다.
+	if (procs) {
+		std::vector<ProcessEvent> events = etwNet.takeProcessEvents();
+		if (!events.empty() || !lastProcessEvents.empty()) {
+			for (auto& entry : activeTargets) {
+				if (entry.activatedList == listCount && !lastProcessEvents.empty()) {
+					std::vector<ProcessEvent> both = lastProcessEvents;
+					both.insert(both.end(), events.begin(), events.end());
+					applyProcessEvents(entry, both, *procs);
+				}
+				else {
+					applyProcessEvents(entry, events, *procs);
+				}
+			}
+		}
+		lastProcessEvents = std::move(events);
+
 		for (auto& entry : activeTargets)
 			syncChildren(entry, *procs);
-		cleanupTick = 0;
 	}
 
 	// PDH 수집 — 실행 중인 타겟이 있을 때만. 전체 프로세스의 값을 한 번에 받아 타겟/자식의 PID만 꺼낸다.

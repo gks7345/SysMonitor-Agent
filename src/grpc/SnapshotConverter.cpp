@@ -9,7 +9,7 @@ namespace {
         return std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
     }
 
-    // default 없는 switch — TargetStatus에 값이 추가되면 C4062(/w14062)가 여기를 고치라고 알려 준다.
+    // default 없는 switch — TargetStatus에 값이 추가되면 C4062(/we4062, 오류)가 여기를 고치라고 알려 준다.
     sysmonitor::TargetInfo::Status toStatus(TargetStatus status) {
         switch (status) {
         case TargetStatus::RUNNING:     return sysmonitor::TargetInfo::RUNNING;
@@ -62,25 +62,26 @@ sysmonitor::AgentData toAgentData(const std::string& agentId, const SnapshotSysD
     sysmonitor::SysSnapshot* sys = data.mutable_sys();
     sys->set_timestamp_us(toEpochMicros(src.timestamp));
 
-    sys->set_cpu_total(src.cpu.cpuTotal);
-    sys->set_cpu_freq_ghz(src.cpu.cpuFreqGHz);
-    sys->set_cpu_user(src.cpu.cpuUser);
-    sys->set_cpu_kernel(src.cpu.cpuKernel);
-    sys->set_cpu_queue_length(src.cpu.cpuQueueLength);
+    // 값이 있을 때만 set한다 — 비어 있으면 필드를 보내지 않아 서버가 "읽지 못함"으로 본다 (fillCommon과 같은 규칙).
+    if (src.cpu.cpuTotal) sys->set_cpu_total(*src.cpu.cpuTotal);
+    if (src.cpu.cpuFreqGHz) sys->set_cpu_freq_ghz(*src.cpu.cpuFreqGHz);
+    if (src.cpu.cpuUser) sys->set_cpu_user(*src.cpu.cpuUser);
+    if (src.cpu.cpuKernel) sys->set_cpu_kernel(*src.cpu.cpuKernel);
+    if (src.cpu.cpuQueueLength) sys->set_cpu_queue_length(*src.cpu.cpuQueueLength);
 
-    sys->set_mem_total_mb(src.mem.memTotalMB);
-    sys->set_mem_usage_percent(src.mem.memUsagePercent);
-    sys->set_mem_used_mb(src.mem.memUsedMB);
-    sys->set_mem_avail_mb(src.mem.memAvailMB);
-    sys->set_commit_mem_percent(src.mem.commitMemPercent);
-    sys->set_committed_mem_gb(src.mem.committedMemGB);
-    sys->set_commit_limit_gb(src.mem.commitLimitGB);
+    if (src.mem.memTotalMB) sys->set_mem_total_mb(*src.mem.memTotalMB);
+    if (src.mem.memUsagePercent) sys->set_mem_usage_percent(*src.mem.memUsagePercent);
+    if (src.mem.memUsedMB) sys->set_mem_used_mb(*src.mem.memUsedMB);
+    if (src.mem.memAvailMB) sys->set_mem_avail_mb(*src.mem.memAvailMB);
+    if (src.mem.commitMemPercent) sys->set_commit_mem_percent(*src.mem.commitMemPercent);
+    if (src.mem.committedMemGB) sys->set_committed_mem_gb(*src.mem.committedMemGB);
+    if (src.mem.commitLimitGB) sys->set_commit_limit_gb(*src.mem.commitLimitGB);
 
-    sys->set_disk_read_kbs(src.disk.diskReadKBs);
-    sys->set_disk_write_kbs(src.disk.diskWriteKBs);
+    if (src.disk.diskReadKBs) sys->set_disk_read_kbs(*src.disk.diskReadKBs);
+    if (src.disk.diskWriteKBs) sys->set_disk_write_kbs(*src.disk.diskWriteKBs);
 
-    sys->set_net_sent_kbps(src.net.netSentKbps);
-    sys->set_net_recv_kbps(src.net.netRecvKbps);
+    if (src.net.netSentKbps) sys->set_net_sent_kbps(*src.net.netSentKbps);
+    if (src.net.netRecvKbps) sys->set_net_recv_kbps(*src.net.netRecvKbps);
     return data;
 }
 
@@ -96,11 +97,12 @@ sysmonitor::AgentData toAgentData(const std::string& agentId, const SnapshotProc
         sysmonitor::ProcInfo* info = proc->add_procs();
         info->set_pid(p.procID);
         info->set_name(p.procName);
-        info->set_cpu_usage(p.procCpuUsage);
-        info->set_memory_mb(p.procMemoryMB);
-        info->set_private_memory_mb(p.procPrivateMemoryMB);
-        info->set_disk_read_mbs(p.procDiskReadMBs);
-        info->set_disk_write_mbs(p.procDiskWriteMBs);
+        // PDH에서 오는 지표는 값이 있을 때만 set한다 (읽지 못한 값을 0으로 보내지 않는다)
+        if (p.procCpuUsage) info->set_cpu_usage(*p.procCpuUsage);
+        if (p.procMemoryMB) info->set_memory_mb(*p.procMemoryMB);
+        if (p.procPrivateMemoryMB) info->set_private_memory_mb(*p.procPrivateMemoryMB);
+        if (p.procDiskReadMBs) info->set_disk_read_mbs(*p.procDiskReadMBs);
+        if (p.procDiskWriteMBs) info->set_disk_write_mbs(*p.procDiskWriteMBs);
         info->set_net_sent_mbps(p.procNetSentMbps);
         info->set_net_recv_mbps(p.procNetRecvMbps);
     }

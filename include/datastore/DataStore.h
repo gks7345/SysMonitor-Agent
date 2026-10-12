@@ -46,6 +46,7 @@ private:
     }
 
     static double safeDouble(double v);
+    static double safeDouble(const std::optional<double>& v);
 
     void checkDailyRotation();
     void flushProcsToDBInternal();

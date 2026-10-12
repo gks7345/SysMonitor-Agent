@@ -57,6 +57,24 @@ struct NetMbps {
     double recvMbps = 0.0;
 };
 
+// -------------------------------------------------------
+// 프로세스 시작/종료 이벤트 한 건 (Microsoft-Windows-Kernel-Process)
+// 프로세스 목록은 1초에 한 번의 단면이라 그 사이에 생겼다 사라진 프로세스를 보지 못한다 — 이벤트는 그것까지 순서대로 알려 준다.
+// -------------------------------------------------------
+struct ProcessEvent {
+    bool  isStart = false;  // false = 종료
+    DWORD pid = 0;
+    DWORD parentPid = 0;    // 시작 이벤트에만 있다 — 그 시점에 실제로 이 프로세스를 만든 부모
+};
+
+// 프로세스 이벤트의 필드 오프셋 (이벤트 ID·버전별로 한 번 조회)
+struct ProcEventLayout {
+    ULONG pidOffset = ULONG_MAX;
+    ULONG parentOffset = ULONG_MAX;
+    ULONG minLength = 0;
+    bool  valid = false;
+};
+
 class ETWNetwork {
 public:
     ETWNetwork();
@@ -71,8 +89,28 @@ public:
     // 죽은 프로세스 accumulator에서 제거
     void retainOnlyPids(const std::unordered_set<DWORD>& alivePids);
 
+    // 프로세스 시작/종료 이벤트를 받고 있는가. 세션을 열지 못했으면(관리자 권한 없음 등) false —
+    // 그때 호출자는 프로세스 목록만으로 동작한다.
+    bool processEventsEnabled() const { return procEventsOn.load(); }
+    // 지난 호출 이후 쌓인 이벤트를 발생 순서대로 꺼낸다 (꺼낸 것은 비워진다).
+    std::vector<ProcessEvent> takeProcessEvents();
+
 private:
     GUID KERNEL_NETWORK_GUID = {};
+    GUID KERNEL_PROCESS_GUID = {};
+
+    // Kernel-Process 공급자: 1 = ProcessStart, 2 = ProcessStop.
+    // 키워드를 주지 않으면 스레드·이미지 로드 이벤트까지 켜져 양이 크게 늘어난다.
+    static constexpr USHORT PROCESS_START_EVENT_ID = 1;
+    static constexpr USHORT PROCESS_STOP_EVENT_ID = 2;
+    static constexpr ULONGLONG KERNEL_PROCESS_KEYWORD_PROCESS = 0x10;
+    // 아무도 꺼내 가지 않을 때 끝없이 쌓이지 않게 하는 상한 — 넘으면 버린다 (호출자는 프로세스 목록으로 계속 동작한다)
+    static constexpr size_t MAX_PENDING_PROCESS_EVENTS = 65536;
+
+    std::atomic<bool> procEventsOn{ false };
+    std::mutex procEventMtx;
+    std::vector<ProcessEvent> procEvents;
+    std::unordered_map<ULONG, ProcEventLayout> procLayoutCache;     // (이벤트 ID << 8 | 버전) -> 오프셋, layoutMtx로 보호
 
     // 이벤트 Id
     // 10 = TcpIp Send,  11 = TcpIp Recv
@@ -114,6 +152,11 @@ private:
     //TDH 파싱
     NetEventLayout buildLayout(PEVENT_RECORD pEvent);
     const NetEventLayout* getOrBuildLayout(PEVENT_RECORD pEvent);
+
+    // 프로세스 이벤트: 필드 이름(ProcessID, ParentProcessID)으로 오프셋을 찾는다 — 이벤트 버전에 따라 사이에 필드가 더 있다
+    static ProcEventLayout buildProcLayout(PEVENT_RECORD pEvent);
+    const ProcEventLayout* getOrBuildProcLayout(PEVENT_RECORD pEvent);
+    void onProcessEvent(PEVENT_RECORD pEvent);
 
     static VOID WINAPI onEvent(PEVENT_RECORD pEvent);
     std::shared_ptr<NetAccumEntry> getOrCreateEntry(DWORD pid);
