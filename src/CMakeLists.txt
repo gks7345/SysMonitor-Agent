@@ -9,7 +9,7 @@
 add_library (SysMonitorAgentCore STATIC
 	"collectors/SystemCollector.cpp" "collectors/CpuCollector.cpp" "collectors/MemCollector.cpp" "collectors/NetCollector.cpp" "collectors/DiskCollector.cpp"
 	"collectors/ProcessCollector.cpp" "collectors/ETWNetwork.cpp" "collectors/TargetCollector.cpp"
-	"datastore/DataStore.cpp" "datastore/SummaryStore.cpp"
+	"datastore/DataStore.cpp" "datastore/SummaryStore.cpp" "datastore/GapBuffer.cpp"
 	"analysis/SessionReport.cpp"
 	"util/StrUtil.cpp" "util/ProcessList.cpp")
 target_include_directories(SysMonitorAgentCore PUBLIC "../include")
@@ -17,10 +17,14 @@ target_include_directories(SysMonitorAgentCore PUBLIC "../include")
 target_compile_definitions(SysMonitorAgentCore PRIVATE
     WIN32_LEAN_AND_MEAN # windows.h 경량화 — winsock.h를 끌어오지 않아 winsock2.h와 충돌하지 않는다
 )
+# duckdb_static을 링크하므로 DuckDB 헤더가 dllimport로 선언하지 않게 한다 (Core의 헤더를 include하는 쪽에도 필요해 PUBLIC)
+target_compile_definitions(SysMonitorAgentCore PUBLIC DUCKDB_STATIC_BUILD)
 
 
+# DuckDB는 정적 라이브러리로 링크한다 — 공유 라이브러리(duckdb)로 링크하면 exe 옆에 duckdb.dll이 있어야 하고,
+# 없으면 로그 한 줄 없이 시작하자마자 종료된다(0xC0000135).
 target_link_libraries(SysMonitorAgentCore PUBLIC
-                                            duckdb
+                                            duckdb_static
                                             spdlog::spdlog
                                             nlohmann_json::nlohmann_json
                                             pdh

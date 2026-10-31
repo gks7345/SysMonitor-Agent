@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -15,6 +16,7 @@
 #include "collectors/SystemCollector.h"
 #include "collectors/ProcessCollector.h"
 #include "collectors/TargetCollector.h"
+#include "datastore/GapBuffer.h"
 #include "grpc/GrpcClient.h"
 #include "util/ProcessList.h"
 #include "util/StrUtil.h"
@@ -101,16 +103,39 @@ std::string readInstanceId() {
     return "";
 }
 
-// Phase 4(재연결) 전까지는 Ok가 아니면 전부 종료한다. Phase 4에서는 Disconnected case만
-// 백오프 재연결로 바꾸면 된다. default를 두지 않아, enum 값이 추가되면 여기도 함께 검토하게 한다.
+// PC 하나에 Agent 하나만 돌게 한다. 같은 PC의 두 프로세스는 instance_id가 같아 서버가 둘 다 받아들이고
+// (한 자리에 데이터가 두 벌 들어가고 재개 지점도 나눠 쓴다), 두 번째는 버퍼 파일을 열지 못한 채 계속 돈다.
+// 설치 폴더가 달라도 막도록 PC 전체에서 보이는 이름(Global\)을 쓴다 (관리자 권한 없이 만들 수 있다).
+// 핸들은 일부러 닫지 않는다 — 프로세스가 어떻게 끝나든 OS가 닫으므로, 잠금 파일처럼 죽은 프로세스의 잠금이 남지 않는다.
+// 이미 있으면 ERROR_ALREADY_EXISTS, 다른 권한으로 실행된 Agent가 만들었으면 ERROR_ACCESS_DENIED로 실패한다 — 둘 다 "이미 실행 중"이다.
+bool acquireSingleInstance() {
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\SysMonitorAgent");
+    const DWORD error = GetLastError();
+    if (mutex && error != ERROR_ALREADY_EXISTS) {
+        return true;
+    }
+    if (mutex) {
+        CloseHandle(mutex);
+    }
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_ACCESS_DENIED) {
+        spdlog::error("[SysMonitorAgent] another SysMonitorAgent is already running on this PC — exiting (only one Agent per PC)");
+    } else {
+        spdlog::error("[SysMonitorAgent] could not check for another running Agent (CreateMutex error {}) — exiting", error);
+    }
+    return false;
+}
+
+// 전송 결과로 계속할지 정한다. Disconnected는 GrpcClient가 스스로 백오프 재연결하고 그동안 틱을 로컬 버퍼에 모으므로
+// 계속한다. 인증 거부·프로토콜 불일치 등은 재시도해도 소용없어 종료한다 (fail-closed).
+// default를 두지 않아, enum 값이 추가되면 여기도 함께 검토하게 한다.
 // 구체적인 원인(gRPC 상태 코드/메시지)은 GrpcClient가 이미 로그로 남긴다.
 bool shouldContinue(ClientResult result, const char* stage) {
     switch (result) {
     case ClientResult::Ok:
         return true;
     case ClientResult::Disconnected:
-        spdlog::error("[SysMonitorAgent] {}: disconnected from server, exiting (reconnect is Phase 4)", stage);
-        return false;
+        spdlog::warn("[SysMonitorAgent] {}: server not reachable — collecting into the local buffer and retrying in the background", stage);
+        return true;
     case ClientResult::Unauthenticated:
         spdlog::error("[SysMonitorAgent] {}: rejected by server — check agent_id/api_key in agent.ini, exiting", stage);
         return false;
@@ -124,13 +149,18 @@ bool shouldContinue(ClientResult result, const char* stage) {
 
 } // namespace
 
-// Phase 3: 실제 수집기(sys / proc 전체 / target)의 스냅샷을 1초마다 실시간 채널로 보낸다.
-// 수집 순서·주기는 원본 SysMonitor의 메인 루프와 같다. 로컬 DuckDB(DataStore)는 끊김 동안의 버퍼 역할로
-// Phase 4-3에서 붙인다 (기획노트 §3) — 그 전까지 연결이 끊기면 종료한다.
+// 실제 수집기(sys / proc 전체 / target)의 스냅샷을 1초마다 GrpcClient에 넘긴다. 수집 순서·주기는 원본 SysMonitor의
+// 메인 루프와 같다. 전송·재연결·갭 전송은 GrpcClient의 스레드가 하고, 끊긴 동안의 틱은 로컬 버퍼(GapBuffer)에 쌓인다.
+// 로컬 버퍼는 이 스레드에서만 다룬다 — 송신 스레드가 요청한 버퍼 작업은 틱 사이 대기 시간에 runBufferTasks()로 실행한다.
 int main() {
     // 소스는 UTF-8(/utf-8)로 컴파일되지만 Windows 콘솔 기본 코드페이지는 CP949라
     // 로그의 한글이 깨져 보인다. 콘솔 출력 코드페이지를 UTF-8로 맞춰 해결한다.
     SetConsoleOutputCP(CP_UTF8);
+
+    // 버퍼를 열거나 서버에 연결하기 전에 막는다.
+    if (!acquireSingleInstance()) {
+        return 1;
+    }
 
     std::optional<std::vector<std::string>> targetNames = parseTargetArgs();
     if (!targetNames) {
@@ -149,9 +179,14 @@ int main() {
     const std::string instanceId = readInstanceId();
     spdlog::info("[SysMonitorAgent] starting, agent_id={}, instance_id={}", config->agentId, instanceId);
 
-    // 인증·프로토콜 버전 오류는 수집기(ETW 세션 등)를 띄우기 전에 빨리 드러나도록 연결을 먼저 한다.
+    // 끊긴 동안의 스냅샷을 보관한다. 설치 폴더 기준 상대 경로라 폴더째 복사되면 함께 따라간다 — 그래서 행마다 수집 장비를 기록하고
+    // 출처는 서버가 판정한다.
+    GapBuffer buffer("reports/buffer/gap_buffer.db", config->localBufferHours);
+
+    // 인증·프로토콜 버전 오류는 수집기(ETW 세션 등)를 띄우기 전에 빨리 드러나도록 첫 연결 결과를 먼저 본다.
+    // 서버에 닿지 않는 것(Disconnected)은 계속한다 — 수집을 시작하고 백그라운드에서 다시 연결한다.
     GrpcClient client(config->serverUrl, config->agentId, config->apiKey, instanceId);
-    if (!shouldContinue(client.connect(), "connect")) {
+    if (!shouldContinue(client.start(), "connect")) {
         return 1;
     }
 
@@ -206,30 +241,37 @@ int main() {
         }
 
         // 원본은 여기서 종료된 타겟의 마지막 세션 요약을 로컬 DuckDB(SessionReport)로 계산해 넣었다.
-        // 로컬 DB는 Phase 4-3에서 붙으므로, 그 전까지 종료된 타겟은 요약 없이 NEVER_SEEN으로 보고된다.
+        // 로컬 버퍼는 전송 메시지를 그대로 보관할 뿐 지표를 조회할 수 없어 요약을 계산하지 못한다 — 종료된 타겟은 요약 없이
+        // NEVER_SEEN으로 보고된다.
         targetCollector.clearPendingDeactivated();
 
-        if (!shouldContinue(client.sendRealtime(sysCollector.makeSnapshot(tickTime), procCollector.makeSnapshot(tickTime), targetCollector.getSnapshot()), "realtime")) {
+        // 막히지 않는다 — 연결돼 있으면 송신 스레드가 보내고, 아니면 로컬 버퍼 작업으로 넘어간다.
+        client.submit(sysCollector.makeSnapshot(tickTime), procCollector.makeSnapshot(tickTime), targetCollector.getSnapshot());
+        if (std::optional<ClientResult> stopped = client.stopped()) {
+            shouldContinue(*stopped, "server");   // 종료 사유를 남긴다
             return 1;
         }
 
-        // 주기적 배치 전송은 새 설계(기획노트 §2)에 없다 — 배치 채널이 살아 있는지 확인하는 Phase 1/2 스캐폴딩이며,
-        // Phase 4-4에서 "재연결 시 갭 전송"으로 교체된다.
-        if (tick % Config::FLUSH_INTERVAL_TICKS == 0) {
-            if (!shouldContinue(client.sendBatchDummy(), "batch")) {
-                return 1;
+        // 보관 시간(local_buffer_hours)이 지난 버퍼 행을 정리한다.
+        if (tick % Config::BUFFER_EXPIRE_INTERVAL_TICKS == 0) {
+            const size_t expired = buffer.dropExpired(std::chrono::duration_cast<std::chrono::microseconds>(tickTime.time_since_epoch()).count());
+            if (expired > 0) {
+                spdlog::warn("[SysMonitorAgent] dropped {} buffered snapshot(s) older than {}h", expired, config->localBufferHours);
             }
         }
 
         ++tick;
 
         // 수집·전송에 쓴 시간을 빼고 남은 시간만 기다려 1초 주기를 유지한다. 그 사이 타겟 등록/해제 요청이 들어오면
-        // 즉시 깨어나 반영한 뒤 deadline까지 다시 기다린다 (원본 SysMonitor와 같은 방식).
+        // 즉시 깨어나 반영한다 (원본 SysMonitor와 같은 방식). 로컬 버퍼 작업은 짧은 간격으로 깨어나 처리한다 —
+        // 갭 전송은 묶음마다 이 작업을 기다리므로, 틱 단위로만 처리하면 하루치 갭을 보내는 데 몇 시간이 걸린다.
         const auto deadline = loopStart + std::chrono::seconds(1);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (targetCollector.waitForPendingUntil(deadline)) {
+        do {
+            client.runBufferTasks(buffer);
+            const auto slice = (std::min)(deadline, std::chrono::steady_clock::now() + Config::BUFFER_TASK_POLL);
+            if (targetCollector.waitForPendingUntil(slice)) {
                 targetCollector.applyPending();
             }
-        }
+        } while (std::chrono::steady_clock::now() < deadline);
     }
 }

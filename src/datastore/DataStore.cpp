@@ -196,7 +196,7 @@ double DataStore::safeDouble(double v) {
 }
 
 // 읽지 못한 값(std::optional 비어 있음)을 여기서는 0으로 저장한다 — 지금 이 저장 경로는 메인 루프에 연결돼 있지 않다.
-// 로컬 버퍼로 되살릴 때 NULL로 저장해야 갭 전송에서도 "읽지 못함"이 0으로 바뀌지 않는다 (아래 타겟 저장과 같은 사정).
+// 이 저장소를 다시 쓸 때는 NULL로 저장해야 "읽지 못함"이 0으로 바뀌지 않는다 (아래 타겟 저장과 같은 사정).
 double DataStore::safeDouble(const std::optional<double>& v) {
     return safeDouble(v.value_or(0.0));
 }
@@ -358,8 +358,7 @@ void DataStore::flushTargetToDBInternal() {
                 mainApp.Append(ts);
                 mainApp.Append(duckdb::string_t(t.targetName));
                 // 수집하지 못한 값(std::optional 비어 있음)을 여기서는 빈 문자열/0으로 저장한다 — 지금 이 저장 경로는
-                // 메인 루프에 연결돼 있지 않다. Phase 4-3에서 로컬 버퍼로 되살릴 때 NULL로 저장해야
-                // 갭 전송(Phase 4-4)에서도 "수집하지 못함"이 0으로 바뀌지 않는다 (Phase 3 리뷰 High #5).
+                // 메인 루프에 연결돼 있지 않다. 이 저장소를 다시 쓸 때는 NULL로 저장해야 "수집하지 못함"이 0으로 바뀌지 않는다.
                 mainApp.Append(duckdb::string_t(t.exePath.value_or(std::string())));
                 mainApp.Append(static_cast<int32_t>(t.pid));
                 mainApp.Append(safeDouble(t.cpuUsage.value_or(0.0)));

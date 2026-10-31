@@ -1,5 +1,6 @@
 ﻿// SysMonitor.h 또는 별도 Config.h
 #pragma once
+#include <chrono>
 
 namespace Config {
     // RingBuffer 용량 (초 단위 = 보관 시간)
@@ -7,8 +8,10 @@ namespace Config {
     constexpr size_t SYS_BUFFER_CAPACITY = 600;  // 120초
     constexpr size_t TARGET_BUFFER_CAPACITY = 600; // 120초
 
-    // flush 주기 (tick 단위 = 초)
-    constexpr int FLUSH_INTERVAL_TICKS = 60;      // 60초
+    // 로컬 버퍼(GapBuffer)에서 보관 시간이 지난 행을 지우는 주기 (tick 단위 = 초)
+    constexpr int BUFFER_EXPIRE_INTERVAL_TICKS = 60;
+    // 틱 사이 대기 중 송신 스레드의 버퍼 작업을 처리하러 깨어나는 간격
+    constexpr std::chrono::milliseconds BUFFER_TASK_POLL{ 20 };
 
     // 프로세스 상위 N개
     constexpr int DEFAULT_TOP_N = 10;
